@@ -12,6 +12,7 @@
 #include <thread>
 #include <vector>
 #include <optional>
+#include <random>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -133,6 +134,9 @@ void sendSnapshotLocked() {
                            "\t" + std::to_string(player.hand.size()) +
                            "\t" + (player.exploded ? cardToken(*player.exploded) : "-"));
     }
+    for (const auto& card : game->discardPile()) {
+      sendLine(client, "DISCARD\t" + cardToken(card));
+    }
     std::ostringstream hand;
     hand << "HAND";
     if (client->player >= 0 && game->players().at(client->player).alive) {
@@ -177,7 +181,8 @@ void processCommand(const std::shared_ptr<Client>& client, const std::vector<std
     } else {
       std::vector<std::string> names;
       for (const auto& item : clients) names.push_back(item->name);
-      game = std::make_unique<ek::Game>(std::move(names), 0xE2025u);
+      std::random_device entropy;
+      game = std::make_unique<ek::Game>(std::move(names), entropy());
       sendResultLocked(game->start());
       sendSnapshotLocked();
     }

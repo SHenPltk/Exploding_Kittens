@@ -40,22 +40,43 @@ void testSetup() {
     CHECK(game.start().ok);
     CHECK(game.drawCount() == expected[count]);
     std::set<int> ids;
+    int totalDefuses = 0;
     for (const Player& player : game.players()) {
       CHECK(player.hand.size() == 8);
       int defuses = 0;
       for (const Card& card : player.hand) {
         CHECK(ids.insert(card.id).second);
+        CHECK(card.type != CardType::ExplodingKitten);
         defuses += card.type == CardType::Defuse;
       }
-      CHECK(defuses == 1);
+      // Spare Defuses are shuffled back before the other seven cards are dealt.
+      CHECK(defuses >= 1);
+      totalDefuses += defuses;
     }
     int kittens = 0;
     for (const Card& card : game.drawPile()) {
       CHECK(ids.insert(card.id).second);
       kittens += card.type == CardType::ExplodingKitten;
+      totalDefuses += card.type == CardType::Defuse;
     }
     CHECK(kittens == count - 1);
+    CHECK(totalDefuses == (count == 5 ? 6 : count + 2));
+    CHECK(ids.size() == static_cast<std::size_t>(expected[count] + count * 8));
   }
+}
+
+void testSetupCanDealExtraDefuses() {
+  auto game = findGame([](const Game& candidate) {
+    for (const Player& player : candidate.players()) {
+      const auto defuses = std::count_if(player.hand.begin(), player.hand.end(),
+          [](const Card& card) { return card.type == CardType::Defuse; });
+      if (defuses > 1) return true;
+    }
+    return false;
+  });
+  CHECK(game->drawCount() == 35);
+  CHECK(game->players().size() == 2);
+  for (const Player& player : game->players()) CHECK(player.hand.size() == 8);
 }
 
 void testNopeCancelsAttack() {
@@ -122,6 +143,7 @@ void testInvalidActions() {
 
 int main() {
   testSetup();
+  testSetupCanDealExtraDefuses();
   testNopeCancelsAttack();
   testNopeCanBeNoped();
   testAttackAndSkip();

@@ -24,6 +24,7 @@ The C++ host listens on TCP port 8765 by default. Messages are UTF-8, one line e
 - `ROSTER player_id name ...`
 - `STATE sequence phase active_player turns_remaining draw_count discard_count winner pending_type pending_actor pending_target nope_count response_leader`
 - `PLAYER player_id name alive hand_count exploded_card_or_dash`
+- `DISCARD card_id:TYPE` (public; repeated for the complete discard pile)
 - `HAND card_id:TYPE ...` (private to that connection)
 - `EVENT OK|ERROR message`
 - `PRIVATE SEE_FUTURE card_id:TYPE ...` (private)

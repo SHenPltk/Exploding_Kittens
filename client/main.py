@@ -39,6 +39,7 @@ class State:
     response_leader: int = -1
     players: dict[int, PlayerView] = field(default_factory=dict)
     hand: list[tuple[int, str]] = field(default_factory=list)
+    discard: list[str] = field(default_factory=list)
 
 
 class Connection:
@@ -138,6 +139,8 @@ class App(tk.Tk):
         self.game.rowconfigure(1, weight=1)
         self.info = ttk.Label(self.game, textvariable=self.status, anchor="w")
         self.info.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        self.discard_info = ttk.Label(self.game, text="Discard: empty", anchor="w", wraplength=760)
+        self.discard_info.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         self.players_box = ttk.LabelFrame(self.game, text="Players", padding=8)
         self.players_box.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
         self.players_box.columnconfigure(0, weight=1)
@@ -215,6 +218,8 @@ class App(tk.Tk):
             self.state.players[int(player_id)] = PlayerView(
                 int(player_id), name, alive == "1", int(hand_size), exploded
             )
+        elif kind == "DISCARD" and parts:
+            self.state.discard.append(parts[0])
         elif kind == "HAND":
             self.state.hand = [(int(token.split(":", 1)[0]), token.split(":", 1)[1]) for token in parts if ":" in token]
             self._render()
@@ -247,6 +252,7 @@ class App(tk.Tk):
         self.state.pending_nopes = int(parts[10])
         self.state.response_leader = int(parts[11])
         self.state.players.clear()
+        self.state.discard.clear()
 
     def _render(self) -> None:
         if not hasattr(self, "game"):
@@ -256,6 +262,7 @@ class App(tk.Tk):
             f"Turns: {self.state.turns_remaining} | Draw pile: {self.state.draw_count} | "
             f"Discard: {self.state.discard_count}"
         )
+        self.discard_info.configure(text="Discard: " + (", ".join(self.state.discard[-12:]) or "empty"))
         for child in self.players_box.winfo_children():
             child.destroy()
         for player in sorted(self.state.players.values(), key=lambda item: item.player_id):
