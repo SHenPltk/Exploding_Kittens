@@ -55,6 +55,7 @@ class Game {
   int discardCount() const { return static_cast<int>(discardPile_.size()); }
   const std::vector<Player>& players() const { return players_; }
   const std::vector<Card>& drawPile() const { return drawPile_; }
+  const std::vector<Card>& discardPile() const { return discardPile_; }
   const std::string& pendingType() const { return pending_.type; }
   int pendingActor() const { return pending_.actor; }
   int pendingTarget() const { return phase_ == Phase::Favor ? favorTarget_ : pending_.target; }

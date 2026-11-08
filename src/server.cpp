@@ -130,7 +130,7 @@ void sendSnapshotLocked() {
     for (const auto& player : game->players()) {
       sendLine(client, "PLAYER\t" + std::to_string(player.id) + "\t" +
                            sanitize(player.name) + "\t" + (player.alive ? "1" : "0") +
-                           "\t" + std::to_string(player.alive ? player.hand.size() : 0) +
+                           "\t" + std::to_string(player.hand.size()) +
                            "\t" + (player.exploded ? cardToken(*player.exploded) : "-"));
     }
     std::ostringstream hand;
