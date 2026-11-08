@@ -1,0 +1,9 @@
+build/
+out/
+.vs/
+*.user
+*.suo
+__pycache__/
+*.pyc
+.venv/
+*.log
