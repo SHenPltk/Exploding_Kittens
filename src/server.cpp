@@ -43,6 +43,7 @@ std::vector<std::shared_ptr<Client>> clients;
 std::unique_ptr<ek::Game> game;
 std::uint64_t sequence = 0;
 std::uint64_t roundNumber = 0;
+bool nextFastMode = false;
 
 void closeSocket(Socket socket) {
 #ifdef _WIN32
@@ -119,14 +120,22 @@ int connectedCountLocked() {
       [](const auto& client) { return client->connected.load(); }));
 }
 
+void sendOptionsLocked(const std::shared_ptr<Client>& client) {
+  sendLine(client, std::string("OPTIONS\t") + (nextFastMode ? "1" : "0"));
+}
+
 void sendRosterLocked() {
+  if (connectedCountLocked() > 3) nextFastMode = false;
   std::ostringstream roster;
   roster << "ROSTER";
   for (const auto& client : clients) {
     if (client->connected) roster << '\t' << client->player << '\t' << sanitize(client->name);
   }
   for (const auto& client : clients) {
-    if (client->connected) sendLine(client, roster.str());
+    if (client->connected) {
+      sendLine(client, roster.str());
+      sendOptionsLocked(client);
+    }
   }
 }
 
@@ -153,6 +162,8 @@ void sendSnapshotLocked() {
     sendLine(client, "ROUND\t" + std::to_string(roundNumber));
     sendLine(client, "SESSION\t" + std::to_string(hostPlayerLocked()) + "\t" +
                          std::to_string(connectedCountLocked()));
+    sendLine(client, std::string("MODE\t") + (game->fastMode() ? "1" : "0"));
+    sendOptionsLocked(client);
     sendLine(client, "DECK\t" + std::to_string(game->bombCount()));
     if (game->phase() == ek::Phase::Response) {
       std::ostringstream pending;
@@ -168,8 +179,8 @@ void sendSnapshotLocked() {
                            "\t" + std::to_string(player.hand.size()) +
                            "\t" + (player.exploded ? cardToken(*player.exploded) : "-"));
     }
-    for (const auto& card : game->discardPile()) {
-      sendLine(client, "DISCARD\t" + cardToken(card));
+    if (!game->discardPile().empty()) {
+      sendLine(client, "DISCARD\t" + cardToken(game->discardPile().back()));
     }
     std::ostringstream hand;
     hand << "HAND";
@@ -206,6 +217,21 @@ void processCommand(const std::shared_ptr<Client>& client, const std::vector<std
     sendLine(client, "PONG");
     return;
   }
+  if (parts[0] == "SET_FAST") {
+    if (client->player != hostPlayerLocked()) {
+      sendLine(client, "EVENT\tERROR\tONLY_HOST_CAN_SET_OPTIONS");
+    } else if (game && game->phase() != ek::Phase::GameOver) {
+      sendLine(client, "EVENT\tERROR\tOPTIONS_LOCKED_DURING_GAME");
+    } else if (parts.size() != 2 || (parts[1] != "0" && parts[1] != "1")) {
+      sendLine(client, "EVENT\tERROR\tINVALID_COMMAND_ARGUMENT");
+    } else if (parts[1] == "1" && connectedCountLocked() > 3) {
+      sendLine(client, "EVENT\tERROR\tFAST_MODE_REQUIRES_2_OR_3_PLAYERS");
+    } else {
+      nextFastMode = parts[1] == "1";
+      sendSnapshotLocked();
+    }
+    return;
+  }
   if (parts[0] == "START" || parts[0] == "RESTART") {
     const bool restart = parts[0] == "RESTART";
     if (client->player != hostPlayerLocked()) {
@@ -216,6 +242,8 @@ void processCommand(const std::shared_ptr<Client>& client, const std::vector<std
       sendLine(client, "EVENT\tERROR\tGAME_ALREADY_STARTED");
     } else if (connectedCountLocked() < 2 || connectedCountLocked() > 5) {
       sendLine(client, "EVENT\tERROR\tPLAYER_COUNT_MUST_BE_2_TO_5");
+    } else if (nextFastMode && connectedCountLocked() > 3) {
+      sendLine(client, "EVENT\tERROR\tFAST_MODE_REQUIRES_2_OR_3_PLAYERS");
     } else {
       std::vector<std::shared_ptr<Client>> participants;
       std::vector<std::string> names;
@@ -227,7 +255,11 @@ void processCommand(const std::shared_ptr<Client>& client, const std::vector<std
       }
       std::random_device entropy;
       auto nextGame = std::make_unique<ek::Game>(std::move(names), entropy());
-      const auto result = nextGame->start();
+      const auto result = nextGame->start(nextFastMode);
+      if (!result.ok) {
+        sendLine(client, "EVENT\tERROR\t" + result.message);
+        return;
+      }
       clients = std::move(participants);
       game = std::move(nextGame);
       ++roundNumber;

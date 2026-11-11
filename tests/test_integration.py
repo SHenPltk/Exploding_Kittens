@@ -23,6 +23,7 @@ class Peer:
         self.stream = self.sock.makefile("r", encoding="utf-8")
         self.player_id = -1
         self.events = []
+        self.next_fast_mode = False
         self.send("JOIN", name)
 
     def send(self, *parts):
@@ -37,6 +38,8 @@ class Peer:
             self.player_id = int(parts[0])
         elif kind == "EVENT":
             self.events.append(parts)
+        elif kind == "OPTIONS":
+            self.next_fast_mode = parts[0] == "1"
         return kind, parts
 
     def wait_for(self, kind):
@@ -57,6 +60,10 @@ class Peer:
                     state.round_number = int(parts[0])
                 elif kind == "SESSION":
                     state.host_player, state.connected_count = map(int, parts)
+                elif kind == "MODE":
+                    state.fast_mode = parts[0] == "1"
+                elif kind == "OPTIONS":
+                    state.next_fast_mode = parts[0] == "1"
                 elif kind == "DECK":
                     state.bombs_remaining = int(parts[0])
                 elif kind == "PENDING":
@@ -132,6 +139,8 @@ class ServerIntegrationTests(unittest.TestCase):
         for state in states:
             if state.phase != "RESPONSE":
                 self.assertEqual(state.pending_cards, [])
+            self.assertLessEqual(len(state.discard), 1)
+            self.assertEqual(bool(state.discard), state.discard_count > 0)
             if state.draw_count:
                 self.assertGreaterEqual(state.bomb_probability, 0)
                 self.assertLessEqual(state.bomb_probability, 1)
@@ -147,10 +156,11 @@ class ServerIntegrationTests(unittest.TestCase):
             states = self.command(peers, actor, *command)
         self.fail("Game failed to finish within card-count bound")
 
-    def assert_fresh_game(self, states, count, round_number):
-        expected = {2: 35, 3: 29, 4: 23, 5: 16}
+    def assert_fresh_game(self, states, count, round_number, fast=False):
+        expected = {2: 24, 3: 20} if fast else {2: 35, 3: 29, 4: 23, 5: 16}
         for state in states:
             self.assertEqual(state.phase, "TURN")
+            self.assertEqual(state.fast_mode, fast)
             self.assertEqual(state.round_number, round_number)
             self.assertEqual(state.active_player, 0)
             self.assertEqual(state.turns_remaining, 1)
@@ -227,6 +237,63 @@ class ServerIntegrationTests(unittest.TestCase):
                 states = self.command(peers, 0, "RESTART")
                 self.assert_fresh_game(states, count, next_round)
 
+    def test_fast_mode_host_setting_and_standard_fast_rematches(self):
+        for count in (2, 3):
+            with self.subTest(players=count):
+                _, peers = self.start_lobby(count)
+                peers[1].send("SET_FAST", 1)
+                self.assertEqual(peers[1].wait_for("EVENT"), ["ERROR", "ONLY_HOST_CAN_SET_OPTIONS"])
+                peers[0].send("SET_FAST", "invalid")
+                self.assertEqual(peers[0].wait_for("EVENT"), ["ERROR", "INVALID_COMMAND_ARGUMENT"])
+                peers[0].send("SET_FAST", 1)
+                for peer in peers:
+                    while peer.wait_for("OPTIONS") != ["1"]:
+                        pass
+                peers[0].send("START")
+                states = [peer.snapshot() for peer in peers]
+                self.assert_fresh_game(states, count, 1, fast=True)
+                self.assertTrue(all(state.next_fast_mode for state in states))
+                peers[0].send("SET_FAST", 0)
+                self.assertEqual(peers[0].wait_for("EVENT"), ["ERROR", "OPTIONS_LOCKED_DURING_GAME"])
+                states = self.finish_game(peers, states)
+                states = self.command(peers, 0, "SET_FAST", 0)
+                self.assertTrue(states[0].fast_mode)
+                self.assertFalse(states[0].next_fast_mode)
+                states = self.command(peers, 0, "RESTART")
+                self.assert_fresh_game(states, count, 2)
+                states = self.finish_game(peers, states)
+                states = self.command(peers, 0, "SET_FAST", 1)
+                self.assertFalse(states[0].fast_mode)
+                self.assertTrue(states[0].next_fast_mode)
+                states = self.command(peers, 0, "RESTART")
+                self.assert_fresh_game(states, count, 3, fast=True)
+
+    def test_fourth_join_disables_fast_option_and_large_games_reject_it(self):
+        port, peers = self.start_lobby(3)
+        peers[0].send("SET_FAST", 1)
+        for peer in peers:
+            while peer.wait_for("OPTIONS") != ["1"]:
+                pass
+        fourth = Peer(port, "玩家四")
+        self.addCleanup(fourth.close)
+        fourth.wait_for("WELCOME")
+        peers.append(fourth)
+        for peer in peers:
+            self.assertEqual(peer.wait_for("OPTIONS"), ["0"])
+        peers[0].send("SET_FAST", 1)
+        self.assertEqual(peers[0].wait_for("EVENT"), ["ERROR", "FAST_MODE_REQUIRES_2_OR_3_PLAYERS"])
+        peers[0].send("START")
+        states = [peer.snapshot() for peer in peers]
+        self.assert_fresh_game(states, 4, 1)
+        states = self.finish_game(peers, states)
+        peers[0].send("SET_FAST", 1)
+        self.assertEqual(peers[0].wait_for("EVENT"), ["ERROR", "FAST_MODE_REQUIRES_2_OR_3_PLAYERS"])
+        states = self.command(peers, 0, "RESTART")
+        self.assert_fresh_game(states, 4, 2)
+        _, five = self.start_lobby(5)
+        five[0].send("SET_FAST", 1)
+        self.assertEqual(five[0].wait_for("EVENT"), ["ERROR", "FAST_MODE_REQUIRES_2_OR_3_PLAYERS"])
+
     def test_duplicate_names_rejected_and_name_released_after_disconnect(self):
         port, peers = self.start_lobby(1)
         duplicate = Peer(port, "  玩家甲  ")
@@ -287,9 +354,46 @@ class ServerIntegrationTests(unittest.TestCase):
         self.addCleanup(other.close)
         other.wait_for("WELCOME")
         pump(lambda: len(app.state.players) == 2)
+        self.assertFalse(app.fast_button.instate(["disabled"]))
+        app.fast_button.invoke()
+        pump(lambda: app.state.next_fast_mode)
         app.start_button.invoke()
         state = other.snapshot()
         pump(lambda: app.state.round_number == 1)
+        self.assertTrue(app.state.fast_mode)
+        self.assertTrue(state.fast_mode)
+        self.assertEqual(app.state.draw_count, 24)
+        self.assertEqual(state.draw_count, 24)
+        self.assertIn("快速模式", app.mode_info.cget("text"))
+
+        # Exercise a real private hand loss before finishing the game. Even a
+        # hand containing no single action card has a matching pair.
+        hand = app.state.hand
+        action = next(((cid, kind) for cid, kind in hand if kind in
+                       {"ATTACK", "SHUFFLE", "SKIP", "SEE_FUTURE", "FAVOR"}), None)
+        if action:
+            removed_types = [action[1]]
+            command = ["PLAY", action[0]] + ([other.player_id] if action[1] == "FAVOR" else [])
+        else:
+            pair_type = next(kind for _, kind in hand if sum(other_kind == kind for _, other_kind in hand) >= 2)
+            pair = [cid for cid, kind in hand if kind == pair_type][:2]
+            removed_types = [pair_type, pair_type]
+            command = ["COMBO", *pair, other.player_id]
+        with patch("main.messagebox.showinfo"):
+            app.connection.send(*command)
+            state = other.snapshot()
+            pump(lambda: app.state.sequence == state.sequence)
+            self.assertIn("失去", app.loss_info.cget("text"))
+            self.assertIn(("lost", tuple(removed_types)), app._log_entries)
+            other.send("PASS")
+            state = other.snapshot()
+            pump(lambda: app.state.sequence == state.sequence)
+        if state.phase == "FAVOR":
+            other.send("FAVOR", state.hand[0][0])
+            state = other.snapshot()
+            pump(lambda: app.state.sequence == state.sequence)
+        self.assertLessEqual(len(state.discard), 1)
+        self.assertIn("弃牌堆顶", app.discard_info.cget("text"))
         for _ in range(120):
             if state.phase == "GAME_OVER":
                 break
@@ -311,11 +415,18 @@ class ServerIntegrationTests(unittest.TestCase):
         self.assertFalse(app.restart_button.instate(["disabled"]))
         app.language_name.set("English")
         app._change_language()
+        app.fast_button.invoke()
+        state = other.snapshot()
+        pump(lambda: not app.state.next_fast_mode)
+        self.assertTrue(app.state.fast_mode)
         app.selected_cards = [99]
         app.restart_button.invoke()
         state = other.snapshot()
         pump(lambda: app.state.round_number == 2)
         self.assertEqual(app.state.phase, "TURN")
+        self.assertFalse(app.state.fast_mode)
+        self.assertEqual(app.state.draw_count, 35)
+        self.assertEqual(app.loss_info.cget("text"), "")
         self.assertEqual(app.selected_cards, [])
         self.assertEqual(app.highlights.deadlines, {})
         self.assertEqual(app.language, "en")

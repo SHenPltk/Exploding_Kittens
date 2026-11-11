@@ -59,11 +59,21 @@ py -3 client\main.py
 - 手牌按 `DEFUSE → ATTACK → FAVOR → NOPE → SHUFFLE → SKIP → SEE_FUTURE → 猫猫牌` 排序，同类牌排在一起。协议中的 `SEE_FUTURE` 对应 See the Future / 预知未来。
 - 手牌及选牌窗口只显示牌名，卡牌编号保留在协议内部。同名牌依然是可单独选择的实体。
 - 摸牌、索要或偷牌获得的新牌会以浅黄色强调约 3 秒，并显示“新获得”提示；普通状态刷新不会重置选牌或延长强调时间。
+- 出牌、组合、被偷牌、交出索要牌或消耗拆除牌等导致手牌减少时，显示约 4 秒的失牌提示（数量与牌名），并保留在本机日志中；只比较本人私有手牌，不向其他玩家泄露牌名。新开局不算失牌。
+- 弃牌区只显示最顶一张牌的名称，仍保留弃牌总数。
 - 反制阶段显示原出牌者、牌名（含组合中的牌）、目标、最近打出 Nope 的玩家，以及当前取消 / 生效状态。
 - 单张猫猫牌无法出牌；仍可组成两张或三张同名组合。服务器也执行此限制。
 - 显示服务器统计的牌堆内剩余炸弹及 `炸弹数 / 牌数` 百分比。正在处理、尚未插回的炸弹不计入牌堆；牌堆为空时概率显示为“—”。这只是未知牌序时的牌堆比例，不能替代预知未来或已知插回位置提供的信息。
 
 The language selector switches all client labels and dialogs live. New cards are highlighted for three seconds; card ids remain internal. The response banner identifies the original play and the latest Nope. Bomb odds use the server's actual draw-pile bomb count divided by the draw-pile size, without revealing positions.
+
+## 快速模式 / Fast mode
+
+房主可在大厅或本局结束后勾选“下一局快速模式（仅 2–3 人）”，随后点击开始 / 重新开始。默认关闭；对局中锁定，其他玩家可看到设置但无法修改。第四名玩家加入大厅时自动关闭快速模式，4–5 人无法开启；之后人数降为 2–3 人需由房主重新开启。
+
+按规则 PDF 的快速变体：发完每人 8 张起手牌之后、放入炸弹之前，随机移除剩余非炸弹牌堆的 `floor(牌数 / 3)` 张。被移除牌的身份不公开，也不放入弃牌堆；随后仍放入 `人数 − 1` 张炸弹并洗牌。2 人开局牌堆为 **24** 张（标准 35 张），3 人为 **20** 张（标准 29 张）。PDF 使用“约三分之一”，本实现统一向下取整。
+
+The host can choose the fast variant before starting or restarting a 2–3 player game. After dealing, remove a random floor(one third) of the remaining non-Kitten draw pile, then insert the normal number of Kittens. Removed card identities stay hidden. The actual current mode and the selection for the next game are shown separately.
 
 All rules and protocol documents are consolidated in `docs/`.
 
@@ -75,6 +85,7 @@ Every command is one UTF-8 line ending in `\\n`:
 JOIN <name>
 START
 RESTART
+SET_FAST <0|1>
 PLAY <card_id> [target_player_id]
 COMBO <card_id> <card_id> <target_player_id>
 COMBO <card_id> <card_id> <card_id> <target_player_id> <requested_card_name>
@@ -87,11 +98,11 @@ DEFUSE <cards_from_top>
 
 Legacy `EXPLODE` requests are rejected with `DEFUSE_REQUIRED` while the player holds a Defuse.
 
-The server sends `WELCOME`, `ROSTER`, `STATE`, `ROUND`, `SESSION`, `DECK`, `PENDING`, `PLAYER`, `DISCARD`, `HAND`, `EVENT`, `PRIVATE`, and `ENDSTATE` lines. `STATE`, `PLAYER`, and `HAND` are rebuilt as a snapshot; a `HAND` line is only sent to the corresponding connection. `PRIVATE SEE_FUTURE` is only sent to the player who used See the Future.
+The server sends `WELCOME`, `ROSTER`, `STATE`, `ROUND`, `SESSION`, `OPTIONS`, `MODE`, `DECK`, `PENDING`, `PLAYER`, `DISCARD`, `HAND`, `EVENT`, `PRIVATE`, and `ENDSTATE` lines. `STATE`, `PLAYER`, and `HAND` are rebuilt as a snapshot; a `HAND` line is only sent to the corresponding connection. `PRIVATE SEE_FUTURE` is only sent to the player who used See the Future.
 
 ## Rules implemented
 
 - 2–5 players and the 56-card original deck.
 - One Defuse plus seven cards per player, then `players - 1` Exploding Kittens in the draw pile.
 - Attack stacking, Skip, See the Future, Shuffle, Favor, Nope chains, Defuse, elimination, winner detection, and same-title two-/three-card combos.
-- The optional fast-game variant is intentionally not enabled in this first playable build.
+- Host-enabled fast-game variant for 2–3 players; standard setup for 4–5 players.

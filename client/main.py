@@ -11,11 +11,11 @@ from tkinter import messagebox, ttk
 try:
     from .i18n import LANGUAGES, card_name, event_text, text
     from .presentation import (CAT_TYPES, CARD_ORDER, HandHighlights, PlayerView,
-                               State, parse_card, response_description, sorted_hand)
+                               State, lost_cards, parse_card, response_description, sorted_hand)
 except ImportError:
     from i18n import LANGUAGES, card_name, event_text, text
     from presentation import (CAT_TYPES, CARD_ORDER, HandHighlights, PlayerView,
-                              State, parse_card, response_description, sorted_hand)
+                              State, lost_cards, parse_card, response_description, sorted_hand)
 
 
 class Connection:
@@ -103,6 +103,9 @@ class App(tk.Tk):
         self.highlights = HandHighlights()
         self._card_widgets: dict[int, ttk.Checkbutton] = {}
         self._highlight_jobs: set[str] = set()
+        self._lost_cards: list[tuple[int, str]] = []
+        self._loss_deadline = 0.0
+        self._loss_job: str | None = None
         self._bindings: list[tuple[tk.Widget, str]] = []
         self._log_entries: list[tuple[str, object]] = []
         self._last_response: tuple | None = None
@@ -111,6 +114,7 @@ class App(tk.Tk):
         self.host = tk.StringVar(value="127.0.0.1")
         self.port = tk.IntVar(value=8765)
         self.name = tk.StringVar(value="")
+        self.fast_mode = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value="")
         self.style = ttk.Style(self)
         self.style.configure("NewCard.TCheckbutton", background="#FFF0B3", foreground="#754700")
@@ -183,6 +187,8 @@ class App(tk.Tk):
         scroll.grid(row=0, column=1, sticky="ns")
         self.gain_info = ttk.Label(self.hand_box, wraplength=550, foreground="#754700")
         self.gain_info.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        self.loss_info = ttk.Label(self.hand_box, wraplength=550, foreground="#A52A2A")
+        self.loss_info.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(4, 0))
         controls = ttk.Frame(self.game, padding=(0, 8, 0, 0))
         controls.grid(row=4, column=0, columnspan=2, sticky="ew")
         buttons = (("draw", lambda: self.connection.send("DRAW")),
@@ -198,6 +204,11 @@ class App(tk.Tk):
         self.start_button.grid(row=1, column=0, columnspan=3, padx=3, pady=(6, 0), sticky="ew")
         self.restart_button = self._bind_text(ttk.Button(controls, command=self._restart), "restart")
         self.restart_button.grid(row=1, column=3, columnspan=3, padx=3, pady=(6, 0), sticky="ew")
+        self.fast_button = self._bind_text(ttk.Checkbutton(controls, variable=self.fast_mode,
+                                                         command=self._set_fast_mode), "fast_option")
+        self.fast_button.grid(row=2, column=0, columnspan=3, sticky="w", padx=3, pady=(6, 0))
+        self.mode_info = ttk.Label(controls)
+        self.mode_info.grid(row=2, column=3, columnspan=3, sticky="e", padx=3, pady=(6, 0))
         self.log = tk.Text(self.game, height=6, state="disabled", wrap="word")
         self.log.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         self.discard_info = ttk.Label(self.game, wraplength=1040)
@@ -268,13 +279,20 @@ class App(tk.Tk):
         elif kind == "SESSION" and self._incoming is not None:
             self._incoming.host_player = int(parts[0])
             self._incoming.connected_count = int(parts[1])
+        elif kind == "MODE" and self._incoming is not None:
+            self._incoming.fast_mode = parts[0] == "1"
+        elif kind == "OPTIONS":
+            target = self._incoming if self._incoming is not None else self.state
+            target.next_fast_mode = parts[0] == "1"
+            if self._incoming is None:
+                self._render()
         elif kind == "DECK" and self._incoming is not None:
             self._incoming.bombs_remaining = int(parts[0])
         elif kind == "PENDING" and self._incoming is not None:
             self._incoming.pending_actor = int(parts[0])
             self._incoming.pending_cards = parts[1:]
         elif kind == "DISCARD" and self._incoming is not None:
-            self._incoming.discard.append(parts[0])
+            self._incoming.discard = [parts[0]]
         elif kind == "HAND" and self._incoming is not None:
             self._incoming.hand = sorted_hand([parse_card(token) for token in parts])
         elif kind == "ENDSTATE" and self._incoming is not None:
@@ -303,7 +321,16 @@ class App(tk.Tk):
 
     def _apply_snapshot(self) -> None:
         assert self._incoming is not None
-        if self._incoming.round_number != self.state.round_number:
+        new_round = self._incoming.round_number != self.state.round_number
+        next_me = self._incoming.players.get(self.player_id)
+        removed = (lost_cards(self.state.hand, self._incoming.hand)
+                   if not new_round and next_me is not None and next_me.alive else [])
+        if new_round:
+            if self._loss_job is not None:
+                self.after_cancel(self._loss_job)
+                self._loss_job = None
+            self._lost_cards = []
+            self._loss_deadline = 0.0
             for job in self._highlight_jobs:
                 self.after_cancel(job)
             self._highlight_jobs.clear()
@@ -313,6 +340,13 @@ class App(tk.Tk):
         self.state = self._incoming
         self._incoming = None
         gained = self.highlights.update(self.state.hand, time.monotonic())
+        if removed:
+            self._lost_cards = removed
+            self._loss_deadline = time.monotonic() + 4.0
+            if self._loss_job is not None:
+                self.after_cancel(self._loss_job)
+            self._loss_job = self.after(4020, self._expire_loss_notice)
+            self._log("lost", tuple(kind for _, kind in removed))
         current_ids = {card_id for card_id, _ in self.state.hand}
         self.selected_cards = [card_id for card_id in self.selected_cards if card_id in current_ids]
         if gained:
@@ -346,8 +380,12 @@ class App(tk.Tk):
             bombs=self.state.bombs_remaining if self.state.bombs_remaining is not None else "—",
             probability=f"{probability:.2%}" if probability is not None else "—"))
         self.response_info.configure(text=response_description(self.state, self.language))
-        discards = [card_name(self.language, parse_card(token)[1]) for token in self.state.discard[-12:]]
-        self.discard_info.configure(text=self.tr("discard", cards=", ".join(discards) or self.tr("empty")))
+        top_discard = (card_name(self.language, parse_card(self.state.discard[-1])[1])
+                       if self.state.discard else self.tr("empty"))
+        self.discard_info.configure(text=self.tr("discard", cards=top_discard))
+        self.fast_mode.set(self.state.next_fast_mode)
+        self.mode_info.configure(text=self.tr("current_mode", mode=self.tr(
+            "fast_mode" if self.state.fast_mode else "standard_mode")))
         for child in self.players_box.winfo_children():
             child.destroy()
         for player in sorted(self.state.players.values(), key=lambda item: item.player_id):
@@ -377,6 +415,17 @@ class App(tk.Tk):
             widget.configure(style="NewCard.TCheckbutton" if card_id in active else "TCheckbutton")
         names = [card_name(self.language, kind) for card_id, kind in self.state.hand if card_id in active]
         self.gain_info.configure(text=self.tr("gained", cards=", ".join(names)) if names else "")
+        self._refresh_loss_notice()
+
+    def _refresh_loss_notice(self) -> None:
+        names = [card_name(self.language, kind) for _, kind in self._lost_cards]
+        visible = names and time.monotonic() < self._loss_deadline
+        self.loss_info.configure(text=self.tr("lost", count=len(names), cards=", ".join(names)) if visible else "")
+
+    def _expire_loss_notice(self) -> None:
+        self._loss_job = None
+        self._lost_cards = []
+        self._refresh_loss_notice()
 
     def _update_controls(self) -> None:
         connected = self.connection.running
@@ -399,6 +448,10 @@ class App(tk.Tk):
         }
         for key, allowed in enabled.items():
             getattr(self, key + "_button").configure(state="normal" if allowed else "disabled")
+        count = self.state.connected_count if self.state.connected_count is not None else len(self.state.players)
+        can_configure = (connected and self.player_id == self.state.host_player
+                         and self.state.phase in {"LOBBY", "GAME_OVER"} and count <= 3)
+        self.fast_button.configure(state="normal" if can_configure else "disabled")
 
     def _toggle_card(self, card_id: int, variable: tk.BooleanVar) -> None:
         if variable.get() and card_id not in self.selected_cards:
@@ -494,6 +547,13 @@ class App(tk.Tk):
         self.wait_window(dialog)
         return result[0] if result else None
 
+    def _set_fast_mode(self) -> None:
+        count = self.state.connected_count if self.state.connected_count is not None else len(self.state.players)
+        if (self.connection.running and self.player_id == self.state.host_player
+                and self.state.phase in {"LOBBY", "GAME_OVER"} and count <= 3):
+            self.connection.send("SET_FAST", int(self.fast_mode.get()))
+        self.fast_mode.set(self.state.next_fast_mode)
+
     def _restart(self) -> None:
         if (self.connection.running and self.state.phase == "GAME_OVER"
                 and self.player_id == self.state.host_player):
@@ -552,6 +612,9 @@ class App(tk.Tk):
                 lines.append(event_text(self.language, data))
             elif kind == "response":
                 lines.append(response_description(data, self.language))
+            elif kind == "lost":
+                lines.append(self.tr("lost", count=len(data),
+                                     cards=", ".join(card_name(self.language, card) for card in data)))
             else:
                 key, values = data
                 lines.append(self.tr(key, **values))
@@ -567,6 +630,9 @@ class App(tk.Tk):
         for job in self._highlight_jobs:
             self.after_cancel(job)
         self._highlight_jobs.clear()
+        if self._loss_job is not None:
+            self.after_cancel(self._loss_job)
+            self._loss_job = None
         super().destroy()
 
     def _close(self) -> None:

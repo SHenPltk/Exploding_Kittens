@@ -35,7 +35,7 @@ struct ActionResult {
 class Game {
  public:
   Game(std::vector<std::string> names, std::uint32_t seed = 1);
-  ActionResult start();
+  ActionResult start(bool fastMode = false);
   ActionResult playCard(int player, int cardId, int target = -1);
   ActionResult playCombo(int player, const std::vector<int>& cardIds, int target = -1,
                          CardType requested = CardType::Defuse);
@@ -48,6 +48,7 @@ class Game {
   ActionResult forfeit(int player);
 
   Phase phase() const { return phase_; }
+  bool fastMode() const { return fastMode_; }
   int activePlayer() const { return activePlayer_; }
   int turnsRemaining() const { return turnsRemaining_; }
   int winner() const { return winner_; }
@@ -83,12 +84,12 @@ class Game {
   Phase phase_ = Phase::Lobby;
   Pending pending_;
   int activePlayer_ = 0, turnsRemaining_ = 1, winner_ = -1, nextCardId_ = 1;
-  bool activeUnderAttack_ = false;
+  bool activeUnderAttack_ = false, fastMode_ = false;
   int kittenPlayer_ = -1, favorActor_ = -1, favorTarget_ = -1;
   Card kitten_;
 
   void buildDeck();
-  void setupHands();
+  void setupHands(bool fastMode);
   void shuffleDraw();
   bool isAlive(int player) const;
   int aliveCount() const;

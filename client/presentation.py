@@ -23,6 +23,11 @@ def sorted_hand(cards: list[tuple[int, str]]) -> list[tuple[int, str]]:
     return sorted(cards, key=lambda card: (CARD_RANK.get(card[1], len(CARD_RANK)), card[0]))
 
 
+def lost_cards(previous: list[tuple[int, str]], current: list[tuple[int, str]]) -> list[tuple[int, str]]:
+    current_ids = {card_id for card_id, _ in current}
+    return sorted_hand([card for card in previous if card[0] not in current_ids])
+
+
 def parse_card(token: str) -> tuple[int, str]:
     card_id, kind = token.split(":", 1)
     return int(card_id), kind
@@ -44,6 +49,8 @@ class State:
     round_number: int = 0
     host_player: int = 0
     connected_count: int | None = None
+    fast_mode: bool = False
+    next_fast_mode: bool = False
     active_player: int = -1
     turns_remaining: int = 0
     draw_count: int = 0

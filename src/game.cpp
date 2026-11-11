@@ -95,7 +95,7 @@ void Game::buildDeck() {
   }
 }
 
-void Game::setupHands() {
+void Game::setupHands(bool fastMode) {
   std::vector<Card> kittens;
   std::vector<Card> defuses;
   std::vector<Card> regular;
@@ -127,6 +127,10 @@ void Game::setupHands() {
     }
   }
   drawPile_ = std::move(regular);
+  if (fastMode) {
+    shuffleDraw();
+    drawPile_.resize(drawPile_.size() - drawPile_.size() / 3);
+  }
   kittens.resize(players_.size() - 1);
   drawPile_.insert(drawPile_.end(), kittens.begin(), kittens.end());
   shuffleDraw();
@@ -139,14 +143,18 @@ int Game::bombCount() const {
       [](const Card& card) { return card.type == CardType::ExplodingKitten; }));
 }
 
-ActionResult Game::start() {
+ActionResult Game::start(bool fastMode) {
   if (phase_ != Phase::Lobby) return reject("GAME_ALREADY_STARTED");
+  if (fastMode && players_.size() > 3) {
+    return reject("FAST_MODE_REQUIRES_2_OR_3_PLAYERS");
+  }
   buildDeck();
-  setupHands();
+  setupHands(fastMode);
   activePlayer_ = 0;
   turnsRemaining_ = 1;
   activeUnderAttack_ = false;
   phase_ = Phase::Turn;
+  fastMode_ = fastMode;
   return accept("GAME_STARTED");
 }
 

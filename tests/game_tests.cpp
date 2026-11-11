@@ -17,12 +17,12 @@ using namespace ek;
 } } while (false)
 
 std::unique_ptr<Game> findGame(const std::function<bool(const Game&)>& predicate,
-                               int playerCount = 2) {
+                               int playerCount = 2, bool fastMode = false) {
   std::vector<std::string> names;
   for (int i = 0; i < playerCount; ++i) names.push_back("P" + std::to_string(i));
   for (std::uint32_t seed = 1; seed < 10000; ++seed) {
     auto game = std::make_unique<Game>(names, seed);
-    CHECK(game->start().ok);
+    CHECK(game->start(fastMode).ok);
     if (predicate(*game)) return game;
   }
   throw std::runtime_error("could not find a deterministic test deal");
@@ -53,7 +53,8 @@ void checkCards(const std::vector<Card>& actual, const std::vector<Card>& expect
 
 std::string publicState(const Game& game) {
   std::ostringstream state;
-  state << phaseName(game.phase()) << ':' << game.activePlayer() << ':'
+  state << phaseName(game.phase()) << ':' << game.fastMode() << ':'
+        << game.activePlayer() << ':'
         << game.turnsRemaining() << ':' << game.winner() << ':'
         << game.drawCount() << ':' << game.bombCount() << ':' << game.discardCount() << ':'
         << game.pendingType() << ':' << game.pendingActor() << ':' << game.pendingTarget()
@@ -138,6 +139,164 @@ void testSetup() {
     CHECK(kittens == count - 1);
     CHECK(totalDefuses == (count == 5 ? 6 : count + 2));
     CHECK(ids.size() == static_cast<std::size_t>(expected[count] + count * 8));
+  }
+}
+
+void testFastSetup() {
+  const int expectedStandard[] = {0, 0, 35, 29};
+  const int expectedFast[] = {0, 0, 24, 20};
+  for (int count : {2, 3}) {
+    std::vector<std::string> names;
+    for (int i = 0; i < count; ++i) names.push_back("P" + std::to_string(i));
+    std::set<std::set<int>> removedSets;
+    bool dealtExtraDefuse = false;
+    bool removedSpareDefuse = false;
+    bool keptSpareDefuse = false;
+    for (std::uint32_t seed = 1; seed <= 64; ++seed) {
+      Game standard(names, seed);
+      Game explicitStandard(names, seed);
+      Game fast(names, seed);
+      Game repeated(names, seed);
+      CHECK(!standard.fastMode());
+      CHECK(!fast.fastMode());
+      CHECK(standard.start().ok);
+      CHECK(explicitStandard.start(false).ok);
+      CHECK(publicState(standard) == publicState(explicitStandard));
+      const ActionResult started = fast.start(true);
+      CHECK(started.ok);
+      CHECK(started.message == "GAME_STARTED");
+      CHECK(started.privatePlayer == -1);
+      CHECK(started.privateCards.empty());
+      CHECK(repeated.start(true).ok);
+      CHECK(publicState(fast) == publicState(repeated));
+      CHECK(!standard.fastMode());
+      CHECK(fast.fastMode());
+      CHECK(fast.phase() == Phase::Turn);
+      CHECK(fast.activePlayer() == 0);
+      CHECK(fast.turnsRemaining() == 1);
+      CHECK(fast.winner() == -1);
+      CHECK(standard.drawCount() == expectedStandard[count]);
+      CHECK(fast.drawCount() == expectedFast[count]);
+      CHECK(standard.bombCount() == count - 1);
+      CHECK(fast.bombCount() == count - 1);
+      CHECK(fast.discardPile().empty());
+      checkBombCount(fast);
+      checkPendingCleared(fast);
+
+      std::set<int> handIds;
+      std::set<int> retainedIds;
+      for (const Player& player : fast.players()) {
+        CHECK(player.alive);
+        CHECK(!player.exploded.has_value());
+        CHECK(player.hand.size() == 8);
+        checkCards(player.hand, standard.hand(player.id));
+        const auto defuses = findCards(fast, player.id, CardType::Defuse).size();
+        CHECK(defuses >= 1);
+        dealtExtraDefuse = dealtExtraDefuse || defuses > 1;
+        for (const Card& card : player.hand) {
+          CHECK(card.type != CardType::ExplodingKitten);
+          CHECK(handIds.insert(card.id).second);
+          CHECK(retainedIds.insert(card.id).second);
+        }
+      }
+
+      std::set<int> standardDrawIds;
+      std::set<int> standardKittens;
+      int totalStandardDefuses = 0;
+      for (const Player& player : standard.players()) {
+        totalStandardDefuses += static_cast<int>(
+            findCards(standard, player.id, CardType::Defuse).size());
+      }
+      for (const Card& card : standard.drawPile()) {
+        CHECK(standardDrawIds.insert(card.id).second);
+        CHECK(handIds.count(card.id) == 0);
+        if (card.type == CardType::ExplodingKitten) standardKittens.insert(card.id);
+        totalStandardDefuses += card.type == CardType::Defuse;
+      }
+      CHECK(totalStandardDefuses == count + 2);
+
+      std::set<int> fastDrawIds;
+      std::set<int> fastKittens;
+      for (const Card& card : fast.drawPile()) {
+        CHECK(retainedIds.insert(card.id).second);
+        CHECK(fastDrawIds.insert(card.id).second);
+        CHECK(std::any_of(standard.drawPile().begin(), standard.drawPile().end(),
+            [&card](const Card& original) {
+              return original.id == card.id && original.type == card.type;
+            }));
+        if (card.type == CardType::ExplodingKitten) fastKittens.insert(card.id);
+        keptSpareDefuse = keptSpareDefuse || card.type == CardType::Defuse;
+      }
+      CHECK(fastKittens == standardKittens);
+      CHECK(retainedIds.size() == static_cast<std::size_t>(count * 8 + expectedFast[count]));
+
+      std::set<int> removed;
+      for (const Card& card : standard.drawPile()) {
+        if (fastDrawIds.count(card.id)) continue;
+        CHECK(card.type != CardType::ExplodingKitten);
+        CHECK(retainedIds.count(card.id) == 0);
+        CHECK(handIds.count(card.id) == 0);
+        CHECK(std::none_of(fast.discardPile().begin(), fast.discardPile().end(),
+            [&card](const Card& discarded) { return discarded.id == card.id; }));
+        CHECK(removed.insert(card.id).second);
+        removedSpareDefuse = removedSpareDefuse || card.type == CardType::Defuse;
+      }
+      const std::size_t remainingNonKittens =
+          standard.drawPile().size() - standardKittens.size();
+      CHECK(remainingNonKittens == static_cast<std::size_t>(count == 2 ? 34 : 27));
+      CHECK(removed.size() == remainingNonKittens / 3);
+      CHECK(removed.size() == static_cast<std::size_t>(count == 2 ? 11 : 9));
+      removedSets.insert(removed);
+    }
+    CHECK(removedSets.size() > 1);
+    CHECK(dealtExtraDefuse);
+    CHECK(removedSpareDefuse);
+    CHECK(keptSpareDefuse);
+  }
+}
+
+void testFastModeStartValidation() {
+  for (int count : {4, 5}) {
+    std::vector<std::string> names;
+    for (int i = 0; i < count; ++i) names.push_back("P" + std::to_string(i));
+    Game game(names, 73);
+    Game fresh(names, 73);
+    const std::string lobbyState = publicState(game);
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      const ActionResult rejected = game.start(true);
+      CHECK(!rejected.ok);
+      CHECK(rejected.message == "FAST_MODE_REQUIRES_2_OR_3_PLAYERS");
+      CHECK(rejected.privatePlayer == -1);
+      CHECK(rejected.privateCards.empty());
+      CHECK(!game.fastMode());
+      CHECK(publicState(game) == lobbyState);
+    }
+    CHECK(game.start().ok);
+    CHECK(fresh.start().ok);
+    // A rejected fast start must not consume RNG or change the subsequent deal.
+    CHECK(publicState(game) == publicState(fresh));
+    const std::string startedState = publicState(game);
+    const ActionResult repeated = game.start(true);
+    CHECK(!repeated.ok);
+    CHECK(repeated.message == "GAME_ALREADY_STARTED");
+    CHECK(publicState(game) == startedState);
+  }
+
+  for (int count : {2, 3}) {
+    for (bool fastMode : {false, true}) {
+      std::vector<std::string> names;
+      for (int i = 0; i < count; ++i) names.push_back("P" + std::to_string(i));
+      Game game(names, 91);
+      CHECK(game.start(fastMode).ok);
+      const std::string before = publicState(game);
+      for (bool requestedMode : {false, true}) {
+        const ActionResult repeated = game.start(requestedMode);
+        CHECK(!repeated.ok);
+        CHECK(repeated.message == "GAME_ALREADY_STARTED");
+        CHECK(game.fastMode() == fastMode);
+        CHECK(publicState(game) == before);
+      }
+    }
   }
 }
 
@@ -444,6 +603,93 @@ void testBombCountAutomaticExplosion() {
   }
 }
 
+void testFastGameToWinner() {
+  for (int playerCount : {2, 3}) {
+    auto game = findGame([](const Game& candidate) {
+      return candidate.drawPile().back().type == CardType::ExplodingKitten;
+    }, playerCount, true);
+    const auto cardIds = [&game]() {
+      std::set<int> ids;
+      const auto appendCards = [&ids](const std::vector<Card>& cards) {
+        for (const Card& card : cards) CHECK(ids.insert(card.id).second);
+      };
+      appendCards(game->drawPile());
+      appendCards(game->discardPile());
+      for (const Player& player : game->players()) appendCards(player.hand);
+      if (game->phase() == Phase::Kitten) {
+        const auto& exploded = game->players()[game->activePlayer()].exploded;
+        CHECK(exploded.has_value());
+        CHECK(ids.insert(exploded->id).second);
+      }
+      return ids;
+    };
+    const std::set<int> initialIds = cardIds();
+    int defusesUsed = 0;
+    int explosions = 0;
+    int actions = 0;
+    while (game->phase() != Phase::GameOver && actions++ < 256) {
+      CHECK(game->fastMode());
+      const int actor = game->activePlayer();
+      CHECK(game->players()[actor].alive);
+      if (game->phase() == Phase::Turn) {
+        CHECK(!game->drawPile().empty());
+        const Card top = game->drawPile().back();
+        const bool hasDefuse = findCard(*game, actor, CardType::Defuse) >= 0;
+        const ActionResult drawn = game->draw(actor);
+        CHECK(drawn.ok);
+        if (top.type == CardType::ExplodingKitten) {
+          if (hasDefuse) {
+            CHECK(drawn.message == "EXPLODING_KITTEN_DRAWN");
+            CHECK(game->phase() == Phase::Kitten);
+          } else {
+            CHECK(drawn.message == "PLAYER_EXPLODED");
+            CHECK(!game->players()[actor].alive);
+            CHECK(game->discardPile().back().id == top.id);
+            ++explosions;
+          }
+        } else {
+          CHECK(drawn.message == "CARD_DRAWN");
+          CHECK(game->hand(actor).back().id == top.id);
+        }
+      } else {
+        CHECK(game->phase() == Phase::Kitten);
+        const int defuseId = findCard(*game, actor, CardType::Defuse);
+        CHECK(defuseId >= 0);
+        const std::string beforeDecline = publicState(*game);
+        const ActionResult declined = game->declineDefuse(actor);
+        CHECK(!declined.ok);
+        CHECK(declined.message == "DEFUSE_REQUIRED");
+        CHECK(publicState(*game) == beforeDecline);
+        const ActionResult defused = game->chooseDefusePosition(actor, 0);
+        CHECK(defused.ok);
+        CHECK(defused.message == "KITTEN_DEFUSED");
+        CHECK(game->discardPile().back().id == defuseId);
+        CHECK(!game->players()[actor].exploded.has_value());
+        ++defusesUsed;
+      }
+      CHECK(cardIds() == initialIds);
+      checkBombCount(*game);
+    }
+    CHECK(game->phase() == Phase::GameOver);
+    CHECK(game->fastMode());
+    CHECK(defusesUsed >= playerCount);
+    CHECK(explosions == playerCount - 1);
+    CHECK(game->bombCount() == 0);
+    CHECK(game->winner() >= 0);
+    CHECK(game->players()[game->winner()].alive);
+    CHECK(std::count_if(game->players().begin(), game->players().end(),
+        [](const Player& player) { return player.alive; }) == 1);
+    CHECK(std::count_if(game->discardPile().begin(), game->discardPile().end(),
+        [](const Card& card) { return card.type == CardType::ExplodingKitten; }) ==
+        playerCount - 1);
+    const std::string finalState = publicState(*game);
+    const ActionResult restarted = game->start(false);
+    CHECK(!restarted.ok);
+    CHECK(restarted.message == "GAME_ALREADY_STARTED");
+    CHECK(publicState(*game) == finalState);
+  }
+}
+
 void testForfeitWithDefuse() {
   for (int playerCount = 2; playerCount <= 5; ++playerCount) {
     auto game = findGame([](const Game& candidate) {
@@ -501,6 +747,9 @@ void testInvalidActions() {
 
 int main() {
   testSetup();
+  testFastSetup();
+  testFastModeStartValidation();
+  testFastGameToWinner();
   testSetupCanDealExtraDefuses();
   testCatCardsRequireCombo();
   testCatCombosAndPendingNopeChains();

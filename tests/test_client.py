@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "client"))
 from main import App, Connection, PlayerView, State
 from i18n import CARD_NAMES, EVENTS, card_name, event_text, text
-from presentation import (CARD_ORDER, HandHighlights, parse_card,
+from presentation import (CARD_ORDER, HandHighlights, lost_cards, parse_card,
                           response_description, sorted_hand)
 
 
@@ -95,6 +95,12 @@ class PresentationTests(unittest.TestCase):
         highlights.update([(1, "DEFUSE")], 2)
         self.assertEqual(highlights.active(2), set())
         self.assertEqual(highlights.update([(1, "DEFUSE"), (2, "ATTACK")], 3), {2})
+
+    def test_loss_tracks_individual_ids_even_when_same_type_is_gained(self):
+        previous = [(1, "DEFUSE"), (2, "TACOCAT"), (3, "TACOCAT")]
+        current = [(1, "DEFUSE"), (4, "TACOCAT")]
+        self.assertEqual(lost_cards(previous, current), [(2, "TACOCAT"), (3, "TACOCAT")])
+        self.assertEqual(lost_cards(previous, list(reversed(previous))), [])
 
     def test_bomb_odds_empty_all_safe_and_all_bombs(self):
         self.assertIsNone(State(draw_count=0, bombs_remaining=0).bomb_probability)
@@ -224,6 +230,86 @@ class AppTests(unittest.TestCase):
             self.app._resolve_prompt()
             self.assertEqual(choose.call_args.args[2], [(4, "拆除"), (9, "拆除")])
             send.assert_called_once_with("FAVOR", 9)
+
+    def test_lost_combo_cards_notice_survives_snapshots_and_translates(self):
+        self.snapshot(["1:DEFUSE", "2:TACOCAT", "3:TACOCAT"])
+        self.app._handle("ENDSTATE", [])
+        with patch("main.time.monotonic", return_value=100):
+            self.snapshot(["1:DEFUSE"], phase="RESPONSE", pending_type="COMBO2",
+                          cards=["TACOCAT", "TACOCAT"])
+            self.app._handle("ENDSTATE", [])
+        self.assertIn("失去 2 张手牌", self.app.loss_info.cget("text"))
+        self.assertEqual(self.app._loss_deadline, 104)
+        with patch("main.time.monotonic", return_value=101):
+            self.snapshot(["1:DEFUSE"])
+            self.app._handle("ENDSTATE", [])
+            self.app.language_name.set("English")
+            self.app._change_language()
+        self.assertIn("Lost 2 card(s): Tacocat, Tacocat", self.app.loss_info.cget("text"))
+        self.assertEqual(sum(kind == "lost" for kind, _ in self.app._log_entries), 1)
+        self.assertEqual(self.app._loss_deadline, 104)
+        with patch("main.time.monotonic", return_value=105):
+            self.app._refresh_loss_notice()
+        self.assertEqual(self.app.loss_info.cget("text"), "")
+        self.assertIn("Lost 2 card(s)", self.app.log.get("1.0", "end"))
+
+    def test_loss_and_gain_can_appear_together_and_new_round_does_not_count_as_loss(self):
+        self.snapshot(["1:DEFUSE", "2:ATTACK"])
+        self.app._handle("ENDSTATE", [])
+        self.snapshot(["1:DEFUSE", "3:NOPE"])
+        self.app._handle("ENDSTATE", [])
+        self.assertIn("攻击", self.app.loss_info.cget("text"))
+        self.assertIn("不行", self.app.gain_info.cget("text"))
+        losses = sum(kind == "lost" for kind, _ in self.app._log_entries)
+        self.snapshot(["4:SHUFFLE"])
+        self.app._handle("ROUND", ["2"])
+        self.app._handle("ENDSTATE", [])
+        self.assertEqual(self.app.loss_info.cget("text"), "")
+        self.assertIsNone(self.app._loss_job)
+        self.assertEqual(sum(kind == "lost" for kind, _ in self.app._log_entries), losses)
+
+    def test_discard_area_shows_only_top_card_and_clears_empty_stack(self):
+        self.snapshot(["1:DEFUSE"])
+        self.app._handle("DISCARD", ["2:ATTACK"])
+        self.app._handle("DISCARD", ["3:SHUFFLE"])
+        self.app._handle("ENDSTATE", [])
+        self.assertEqual(self.app.state.discard, ["3:SHUFFLE"])
+        self.assertEqual(self.app.discard_info.cget("text"), "弃牌堆顶：洗牌")
+        self.app.language_name.set("English")
+        self.app._change_language()
+        self.assertEqual(self.app.discard_info.cget("text"), "Top discard: Shuffle")
+        self.snapshot(["1:DEFUSE"])
+        self.app._handle("ENDSTATE", [])
+        self.assertEqual(self.app.discard_info.cget("text"), "Top discard: empty")
+
+    def test_fast_mode_control_is_host_only_for_small_lobby_or_game_over(self):
+        self.assertFalse(self.app.fast_button.instate(["disabled"]))
+        with patch.object(self.app.connection, "send") as send:
+            self.app.fast_button.invoke()
+            send.assert_called_once_with("SET_FAST", 1)
+        self.app._handle("OPTIONS", ["1"])
+        self.assertTrue(self.app.fast_mode.get())
+        self.app.language_name.set("English")
+        self.app._change_language()
+        self.assertIn("Fast mode", self.app.fast_button.cget("text"))
+        for player, phase, count in ((1, "LOBBY", 2), (0, "TURN", 2), (0, "LOBBY", 4)):
+            self.app.player_id = player
+            self.app.state.phase = phase
+            self.app.state.connected_count = count
+            self.app._update_controls()
+            self.assertTrue(self.app.fast_button.instate(["disabled"]))
+        self.app.player_id = 0
+        self.app.state.phase = "GAME_OVER"
+        self.app.state.connected_count = 3
+        self.app._update_controls()
+        self.assertFalse(self.app.fast_button.instate(["disabled"]))
+        self.snapshot(["1:DEFUSE"])
+        self.app._handle("MODE", ["1"])
+        self.app._handle("OPTIONS", ["0"])
+        self.app._handle("ENDSTATE", [])
+        self.assertTrue(self.app.state.fast_mode)
+        self.assertFalse(self.app.fast_mode.get())
+        self.assertIn("Fast mode", self.app.mode_info.cget("text"))
 
     def test_defuse_prompt_has_no_decline_action(self):
         self.snapshot(["1:DEFUSE"], phase="KITTEN")
