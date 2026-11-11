@@ -296,12 +296,13 @@ void testAttackAndSkip() {
   CHECK(game->draw(victim).ok);
 }
 
-void testBombCountDrawDefuseAndDecline() {
+void testBombCountDrawAndRequiredDefuse() {
   for (int playerCount = 2; playerCount <= 5; ++playerCount) {
     auto game = findGame([](const Game& candidate) {
       const auto& pile = candidate.drawPile();
       return pile.back().type != CardType::ExplodingKitten &&
-             pile[pile.size() - 2].type == CardType::ExplodingKitten;
+             pile[pile.size() - 2].type == CardType::ExplodingKitten &&
+             findCards(candidate, 1, CardType::Defuse).size() > 1;
     }, playerCount);
     const int initialBombs = playerCount - 1;
     const int initialDrawCount = game->drawCount();
@@ -327,11 +328,30 @@ void testBombCountDrawDefuseAndDecline() {
     CHECK(game->players()[defuser].exploded->id == kitten.id);
     checkBombCount(*game);
     const std::string beforeInvalidPosition = publicState(*game);
-    CHECK(!game->chooseDefusePosition(defuser, game->drawPile().size() + 1).ok);
+    const ActionResult invalidPosition =
+        game->chooseDefusePosition(defuser, game->drawPile().size() + 1);
+    CHECK(!invalidPosition.ok);
+    CHECK(invalidPosition.message == "INVALID_KITTEN_POSITION");
     CHECK(publicState(*game) == beforeInvalidPosition);
 
+    const std::string beforeDecline = publicState(*game);
+    for (int other : {-1, firstActor, playerCount}) {
+      const ActionResult invalidDecline = game->declineDefuse(other);
+      CHECK(!invalidDecline.ok);
+      CHECK(invalidDecline.message == "NO_KITTEN_PROMPT");
+      CHECK(publicState(*game) == beforeDecline);
+    }
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      const ActionResult declined = game->declineDefuse(defuser);
+      CHECK(!declined.ok);
+      CHECK(declined.message == "DEFUSE_REQUIRED");
+      CHECK(publicState(*game) == beforeDecline);
+    }
+
     const std::size_t defuserHand = game->hand(defuser).size();
-    CHECK(game->chooseDefusePosition(defuser, 0).ok);
+    const ActionResult defused = game->chooseDefusePosition(defuser, 0);
+    CHECK(defused.ok);
+    CHECK(defused.message == "KITTEN_DEFUSED");
     CHECK(game->phase() == Phase::Turn);
     CHECK(game->drawCount() == initialDrawCount - 1);
     CHECK(game->bombCount() == initialBombs);
@@ -341,20 +361,45 @@ void testBombCountDrawDefuseAndDecline() {
     CHECK(game->discardPile().back().type == CardType::Defuse);
     checkBombCount(*game);
 
-    const int victim = game->activePlayer();
-    CHECK(game->draw(victim).ok);
-    CHECK(game->phase() == Phase::Kitten);
-    CHECK(game->drawCount() == initialDrawCount - 2);
-    CHECK(game->bombCount() == initialBombs - 1);
-    checkBombCount(*game);
-    CHECK(game->declineDefuse(victim).ok);
-    CHECK(!game->players()[victim].alive);
-    CHECK(game->players()[victim].exploded->id == kitten.id);
-    CHECK(game->discardPile().back().id == kitten.id);
-    CHECK(game->drawCount() == initialDrawCount - 2);
-    CHECK(game->bombCount() == initialBombs - 1);
-    CHECK(game->phase() == (playerCount == 2 ? Phase::GameOver : Phase::Turn));
-    checkBombCount(*game);
+    int availableDefuses = 0;
+    for (const Player& player : game->players()) {
+      availableDefuses += static_cast<int>(findCards(*game, player.id, CardType::Defuse).size());
+    }
+    bool exploded = false;
+    for (int turn = 0; turn <= availableDefuses; ++turn) {
+      const int victim = game->activePlayer();
+      const bool hasDefuse = findCard(*game, victim, CardType::Defuse) >= 0;
+      const ActionResult result = game->draw(victim);
+      CHECK(result.ok);
+      CHECK(game->drawCount() == initialDrawCount - 2);
+      CHECK(game->bombCount() == initialBombs - 1);
+      checkBombCount(*game);
+      if (hasDefuse) {
+        CHECK(result.message == "EXPLODING_KITTEN_DRAWN");
+        CHECK(game->phase() == Phase::Kitten);
+        const std::string before = publicState(*game);
+        const ActionResult declined = game->declineDefuse(victim);
+        CHECK(!declined.ok);
+        CHECK(declined.message == "DEFUSE_REQUIRED");
+        CHECK(publicState(*game) == before);
+        CHECK(game->chooseDefusePosition(victim, 0).ok);
+        CHECK(game->phase() == Phase::Turn);
+        CHECK(game->drawCount() == initialDrawCount - 1);
+        CHECK(game->bombCount() == initialBombs);
+        CHECK(game->drawPile().back().id == kitten.id);
+        checkBombCount(*game);
+        continue;
+      }
+      CHECK(result.message == "PLAYER_EXPLODED");
+      CHECK(!game->players()[victim].alive);
+      CHECK(game->players()[victim].exploded.has_value());
+      CHECK(game->players()[victim].exploded->id == kitten.id);
+      CHECK(game->discardPile().back().id == kitten.id);
+      CHECK(game->phase() == (playerCount == 2 ? Phase::GameOver : Phase::Turn));
+      exploded = true;
+      break;
+    }
+    CHECK(exploded);
   }
 }
 
@@ -399,11 +444,59 @@ void testBombCountAutomaticExplosion() {
   }
 }
 
+void testForfeitWithDefuse() {
+  for (int playerCount = 2; playerCount <= 5; ++playerCount) {
+    auto game = findGame([](const Game& candidate) {
+      return candidate.drawPile().back().type == CardType::ExplodingKitten;
+    }, playerCount);
+    const int victim = game->activePlayer();
+    const Card kitten = game->drawPile().back();
+    const std::vector<Card> hand = game->hand(victim);
+    CHECK(findCard(*game, victim, CardType::Defuse) >= 0);
+    CHECK(game->draw(victim).ok);
+    CHECK(game->phase() == Phase::Kitten);
+    const std::string beforeDecline = publicState(*game);
+    const ActionResult declined = game->declineDefuse(victim);
+    CHECK(!declined.ok);
+    CHECK(declined.message == "DEFUSE_REQUIRED");
+    CHECK(publicState(*game) == beforeDecline);
+
+    const int drawCount = game->drawCount();
+    const int bombCount = game->bombCount();
+    const int discardCount = game->discardCount();
+    const ActionResult result = game->forfeit(victim);
+    CHECK(result.ok);
+    CHECK(result.message == "DISCONNECTED_PLAYER_EXPLODED");
+    CHECK(!game->players()[victim].alive);
+    CHECK(game->players()[victim].exploded.has_value());
+    CHECK(game->players()[victim].exploded->id == kitten.id);
+    checkCards(game->hand(victim), hand);
+    CHECK(game->drawCount() == drawCount);
+    CHECK(game->bombCount() == bombCount);
+    CHECK(game->discardCount() == discardCount + 1);
+    CHECK(game->discardPile().back().id == kitten.id);
+    CHECK(game->phase() == (playerCount == 2 ? Phase::GameOver : Phase::Turn));
+    CHECK(game->winner() == (playerCount == 2 ? 1 : -1));
+    if (playerCount > 2) CHECK(game->activePlayer() == 1);
+    checkBombCount(*game);
+  }
+}
+
 void testInvalidActions() {
   Game game({"A", "B"}, 4);
   CHECK(!game.playCard(0, 1).ok);
+  const std::string lobbyState = publicState(game);
+  const ActionResult lobbyDecline = game.declineDefuse(0);
+  CHECK(!lobbyDecline.ok);
+  CHECK(lobbyDecline.message == "NO_KITTEN_PROMPT");
+  CHECK(publicState(game) == lobbyState);
   CHECK(game.start().ok);
   CHECK(!game.draw(1 - game.activePlayer()).ok);
+  const std::string turnState = publicState(game);
+  const ActionResult turnDecline = game.declineDefuse(game.activePlayer());
+  CHECK(!turnDecline.ok);
+  CHECK(turnDecline.message == "NO_KITTEN_PROMPT");
+  CHECK(publicState(game) == turnState);
 }
 
 int main() {
@@ -414,8 +507,9 @@ int main() {
   testNopeCancelsAttack();
   testNopeCanBeNoped();
   testAttackAndSkip();
-  testBombCountDrawDefuseAndDecline();
+  testBombCountDrawAndRequiredDefuse();
   testBombCountAutomaticExplosion();
+  testForfeitWithDefuse();
   testInvalidActions();
   std::cout << "game tests passed\n";
 }

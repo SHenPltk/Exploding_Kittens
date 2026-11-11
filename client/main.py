@@ -23,15 +23,23 @@ class Connection:
         self.events = events
         self.sock: socket.socket | None = None
         self.running = False
+        self._reader_thread: threading.Thread | None = None
 
     def connect(self, host: str, port: int, name: str) -> None:
         if self.running:
             return
+        self.close()
+        while True:
+            try:
+                self.events.get_nowait()
+            except queue.Empty:
+                break
         self.sock = socket.create_connection((host, port), timeout=8)
         self.sock.settimeout(None)
         self.running = True
         self.send("JOIN", name)
-        threading.Thread(target=self._reader, daemon=True).start()
+        self._reader_thread = threading.Thread(target=self._reader, daemon=True)
+        self._reader_thread.start()
 
     def send(self, command: str, *arguments: object) -> None:
         if not self.sock or not self.running:
@@ -53,6 +61,9 @@ class Connection:
                 pass
             self.sock.close()
             self.sock = None
+        if self._reader_thread is not None and self._reader_thread is not threading.current_thread():
+            self._reader_thread.join(timeout=1)
+        self._reader_thread = None
 
     def _reader(self) -> None:
         sock = self.sock
@@ -95,6 +106,7 @@ class App(tk.Tk):
         self._bindings: list[tuple[tk.Widget, str]] = []
         self._log_entries: list[tuple[str, object]] = []
         self._last_response: tuple | None = None
+        self._join_error = False
         self.language_name = tk.StringVar(value="简体中文")
         self.host = tk.StringVar(value="127.0.0.1")
         self.port = tk.IntVar(value=8765)
@@ -184,8 +196,8 @@ class App(tk.Tk):
             setattr(self, key + "_button", button)
         self.start_button = self._bind_text(ttk.Button(controls, command=lambda: self.connection.send("START")), "start")
         self.start_button.grid(row=1, column=0, columnspan=3, padx=3, pady=(6, 0), sticky="ew")
-        self.decline_button = self._bind_text(ttk.Button(controls, command=self._decline_defuse), "decline")
-        self.decline_button.grid(row=1, column=3, columnspan=3, padx=3, pady=(6, 0), sticky="ew")
+        self.restart_button = self._bind_text(ttk.Button(controls, command=self._restart), "restart")
+        self.restart_button.grid(row=1, column=3, columnspan=3, padx=3, pady=(6, 0), sticky="ew")
         self.log = tk.Text(self.game, height=6, state="disabled", wrap="word")
         self.log.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         self.discard_info = ttk.Label(self.game, wraplength=1040)
@@ -213,6 +225,7 @@ class App(tk.Tk):
             if any(char in name for char in "\r\n\t"):
                 messagebox.showerror(self.tr("connection_failed"), self.tr("invalid_name"), parent=self)
                 return
+            self._join_error = False
             self.connection.connect(self.host.get().strip(), int(self.port.get()), name)
             self.status.set(self.tr("connecting"))
         except (OSError, ValueError, tk.TclError) as error:
@@ -250,6 +263,11 @@ class App(tk.Tk):
             player_id, name, alive, hand_size = parts[:4]
             self._incoming.players[int(player_id)] = PlayerView(
                 int(player_id), name, alive == "1", int(hand_size), parts[4] if len(parts) > 4 else "-")
+        elif kind == "ROUND" and self._incoming is not None:
+            self._incoming.round_number = int(parts[0])
+        elif kind == "SESSION" and self._incoming is not None:
+            self._incoming.host_player = int(parts[0])
+            self._incoming.connected_count = int(parts[1])
         elif kind == "DECK" and self._incoming is not None:
             self._incoming.bombs_remaining = int(parts[0])
         elif kind == "PENDING" and self._incoming is not None:
@@ -265,11 +283,17 @@ class App(tk.Tk):
             self._log("event", parts[1])
             if parts[0] == "ERROR":
                 self.status.set(event_text(self.language, parts[1]))
+                if not hasattr(self, "game"):
+                    self._join_error = True
+                    messagebox.showerror(self.tr("connection_failed"),
+                                         event_text(self.language, parts[1]), parent=self)
         elif kind == "PRIVATE" and parts and parts[0] == "SEE_FUTURE":
             names = [card_name(self.language, parse_card(token)[1]) for token in parts[1:]]
             messagebox.showinfo(self.tr("future_title"),
                                 self.tr("future_prompt", cards="\n".join(names) or self.tr("empty")), parent=self)
         elif kind == "ERROR":
+            if self._join_error and not hasattr(self, "game") and parts == ["connection closed"]:
+                return
             key = "disconnected" if parts == ["connection closed"] else "connection_error"
             values = {} if key == "disconnected" else {"detail": " ".join(parts)}
             self.status.set(self.tr(key, **values))
@@ -279,6 +303,13 @@ class App(tk.Tk):
 
     def _apply_snapshot(self) -> None:
         assert self._incoming is not None
+        if self._incoming.round_number != self.state.round_number:
+            for job in self._highlight_jobs:
+                self.after_cancel(job)
+            self._highlight_jobs.clear()
+            self.highlights = HandHighlights()
+            self.selected_cards.clear()
+            self._last_response = None
         self.state = self._incoming
         self._incoming = None
         gained = self.highlights.update(self.state.hand, time.monotonic())
@@ -363,7 +394,8 @@ class App(tk.Tk):
             "start": connected and self.player_id == 0 and self.state.phase == "LOBBY" and len(self.state.players) >= 2,
             "resolve": connected and alive and ((self.state.phase == "FAVOR" and self.player_id == self.state.pending_target)
                             or (self.state.phase == "KITTEN" and self.player_id == self.state.active_player)),
-            "decline": connected and alive and self.state.phase == "KITTEN" and self.player_id == self.state.active_player,
+            "restart": connected and self.player_id == self.state.host_player and self.state.phase == "GAME_OVER"
+                       and (self.state.connected_count if self.state.connected_count is not None else len(self.state.players)) >= 2,
         }
         for key, allowed in enabled.items():
             getattr(self, key + "_button").configure(state="normal" if allowed else "disabled")
@@ -462,9 +494,10 @@ class App(tk.Tk):
         self.wait_window(dialog)
         return result[0] if result else None
 
-    def _decline_defuse(self) -> None:
-        if messagebox.askyesno(self.tr("decline"), self.tr("decline_confirm"), parent=self):
-            self.connection.send("EXPLODE")
+    def _restart(self) -> None:
+        if (self.connection.running and self.state.phase == "GAME_OVER"
+                and self.player_id == self.state.host_player):
+            self.connection.send("RESTART")
 
     def _target(self) -> int | None:
         options = [(player.player_id, player.name) for player in self.state.players.values()

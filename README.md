@@ -53,6 +53,9 @@ py -3 client\main.py
 ## 界面与交互 / Interface
 
 - 默认使用简体中文，可在窗口右上角随时切换 English；按钮、牌名、阶段、日志和选牌窗口一起切换。
+- 同一房间不允许重复昵称；服务器去除昵称两端空白后按原文比较（区分大小写）。重名会留在登录页提示，可直接改名重试。
+- 摸到炸弹猫且持有 DEFUSE 时必须拆除；界面不再提供放弃按钮，服务器也拒绝主动爆炸请求。没有 DEFUSE 时自动出局。
+- 本局结束后房主可点击“重新开始”，至少两名在线玩家即可立即重新洗牌发牌；已出局但在线的玩家重新入局，断线玩家不参加。房主离线时由下一位在线玩家接替。语言保留，上一局的手牌选择和高亮清空。
 - 手牌按 `DEFUSE → ATTACK → FAVOR → NOPE → SHUFFLE → SKIP → SEE_FUTURE → 猫猫牌` 排序，同类牌排在一起。协议中的 `SEE_FUTURE` 对应 See the Future / 预知未来。
 - 手牌及选牌窗口只显示牌名，卡牌编号保留在协议内部。同名牌依然是可单独选择的实体。
 - 摸牌、索要或偷牌获得的新牌会以浅黄色强调约 3 秒，并显示“新获得”提示；普通状态刷新不会重置选牌或延长强调时间。
@@ -71,6 +74,7 @@ Every command is one UTF-8 line ending in `\\n`:
 ```text
 JOIN <name>
 START
+RESTART
 PLAY <card_id> [target_player_id]
 COMBO <card_id> <card_id> <target_player_id>
 COMBO <card_id> <card_id> <card_id> <target_player_id> <requested_card_name>
@@ -79,10 +83,11 @@ PASS
 NOPE <card_id>
 FAVOR <card_id>
 DEFUSE <cards_from_top>
-EXPLODE
 ```
 
-The server sends `WELCOME`, `ROSTER`, `STATE`, `DECK`, `PENDING`, `PLAYER`, `DISCARD`, `HAND`, `EVENT`, `PRIVATE`, and `ENDSTATE` lines. `STATE`, `PLAYER`, and `HAND` are rebuilt as a snapshot; a `HAND` line is only sent to the corresponding connection. `PRIVATE SEE_FUTURE` is only sent to the player who used See the Future.
+Legacy `EXPLODE` requests are rejected with `DEFUSE_REQUIRED` while the player holds a Defuse.
+
+The server sends `WELCOME`, `ROSTER`, `STATE`, `ROUND`, `SESSION`, `DECK`, `PENDING`, `PLAYER`, `DISCARD`, `HAND`, `EVENT`, `PRIVATE`, and `ENDSTATE` lines. `STATE`, `PLAYER`, and `HAND` are rebuilt as a snapshot; a `HAND` line is only sent to the corresponding connection. `PRIVATE SEE_FUTURE` is only sent to the player who used See the Future.
 
 ## Rules implemented
 

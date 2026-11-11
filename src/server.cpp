@@ -42,6 +42,7 @@ std::mutex stateMutex;
 std::vector<std::shared_ptr<Client>> clients;
 std::unique_ptr<ek::Game> game;
 std::uint64_t sequence = 0;
+std::uint64_t roundNumber = 0;
 
 void closeSocket(Socket socket) {
 #ifdef _WIN32
@@ -99,13 +100,34 @@ std::string sanitize(std::string value) {
   return value;
 }
 
+std::string normalizeName(std::string name) {
+  const auto first = name.find_first_not_of(" \t\r\n");
+  if (first == std::string::npos) return {};
+  const auto last = name.find_last_not_of(" \t\r\n");
+  return name.substr(first, last - first + 1);
+}
+
+int hostPlayerLocked() {
+  for (const auto& client : clients) {
+    if (client->connected) return client->player;
+  }
+  return -1;
+}
+
+int connectedCountLocked() {
+  return static_cast<int>(std::count_if(clients.begin(), clients.end(),
+      [](const auto& client) { return client->connected.load(); }));
+}
+
 void sendRosterLocked() {
   std::ostringstream roster;
   roster << "ROSTER";
   for (const auto& client : clients) {
-    roster << '\t' << client->player << '\t' << sanitize(client->name);
+    if (client->connected) roster << '\t' << client->player << '\t' << sanitize(client->name);
   }
-  for (const auto& client : clients) sendLine(client, roster.str());
+  for (const auto& client : clients) {
+    if (client->connected) sendLine(client, roster.str());
+  }
 }
 
 std::string cardToken(const ek::Card& card) {
@@ -128,6 +150,9 @@ void sendSnapshotLocked() {
           << game->pendingActor() << '\t' << game->pendingTarget() << '\t'
           << game->pendingNopeCount() << '\t' << game->responseLeader();
     sendLine(client, state.str());
+    sendLine(client, "ROUND\t" + std::to_string(roundNumber));
+    sendLine(client, "SESSION\t" + std::to_string(hostPlayerLocked()) + "\t" +
+                         std::to_string(connectedCountLocked()));
     sendLine(client, "DECK\t" + std::to_string(game->bombCount()));
     if (game->phase() == ek::Phase::Response) {
       std::ostringstream pending;
@@ -175,24 +200,42 @@ void sendResultLocked(const ek::ActionResult& result) {
 
 void processCommand(const std::shared_ptr<Client>& client, const std::vector<std::string>& parts) {
   std::lock_guard<std::mutex> lock(stateMutex);
-  if (parts.empty()) return;
+  if (parts.empty() || !client->connected) return;
+  if (std::find(clients.begin(), clients.end(), client) == clients.end()) return;
   if (parts[0] == "PING") {
     sendLine(client, "PONG");
     return;
   }
-  if (parts[0] == "START") {
-    if (game) {
-      sendLine(client, "EVENT\tERROR\tGAME_ALREADY_STARTED");
-    } else if (client->player != 0) {
+  if (parts[0] == "START" || parts[0] == "RESTART") {
+    const bool restart = parts[0] == "RESTART";
+    if (client->player != hostPlayerLocked()) {
       sendLine(client, "EVENT\tERROR\tONLY_HOST_CAN_START");
-    } else if (clients.size() < 2 || clients.size() > 5) {
+    } else if (restart && (!game || game->phase() != ek::Phase::GameOver)) {
+      sendLine(client, "EVENT\tERROR\tGAME_NOT_OVER");
+    } else if (!restart && game) {
+      sendLine(client, "EVENT\tERROR\tGAME_ALREADY_STARTED");
+    } else if (connectedCountLocked() < 2 || connectedCountLocked() > 5) {
       sendLine(client, "EVENT\tERROR\tPLAYER_COUNT_MUST_BE_2_TO_5");
     } else {
+      std::vector<std::shared_ptr<Client>> participants;
       std::vector<std::string> names;
-      for (const auto& item : clients) names.push_back(item->name);
+      for (const auto& item : clients) {
+        if (item->connected) {
+          participants.push_back(item);
+          names.push_back(item->name);
+        }
+      }
       std::random_device entropy;
-      game = std::make_unique<ek::Game>(std::move(names), entropy());
-      sendResultLocked(game->start());
+      auto nextGame = std::make_unique<ek::Game>(std::move(names), entropy());
+      const auto result = nextGame->start();
+      clients = std::move(participants);
+      game = std::move(nextGame);
+      ++roundNumber;
+      for (std::size_t i = 0; i < clients.size(); ++i) {
+        clients[i]->player = static_cast<int>(i);
+        sendLine(clients[i], "WELCOME\t" + std::to_string(i));
+      }
+      sendResultLocked(result);
       sendSnapshotLocked();
     }
     return;
@@ -259,7 +302,9 @@ void clientThread(const std::shared_ptr<Client>& client) {
   if (game && game->phase() != ek::Phase::GameOver) {
     sendResultLocked(game->forfeit(client->player));
     sendSnapshotLocked();
-  } else if (!game) {
+  } else if (game) {
+    sendSnapshotLocked();
+  } else {
     clients.erase(std::remove_if(clients.begin(), clients.end(),
                                  [client](const auto& item) { return item == client; }),
                   clients.end());
@@ -331,8 +376,14 @@ int main(int argc, char** argv) {
       continue;
     }
     const auto parts = split(hello);
-    if (parts.size() < 2 || parts[0] != "JOIN" || parts[1].empty()) {
+    if (parts.size() != 2 || parts[0] != "JOIN") {
       sendLine(client, "EVENT\tERROR\tFIRST_COMMAND_MUST_BE_JOIN");
+      closeSocket(clientSocket);
+      continue;
+    }
+    const std::string name = normalizeName(parts[1]);
+    if (name.empty()) {
+      sendLine(client, "EVENT\tERROR\tINVALID_NAME");
       closeSocket(clientSocket);
       continue;
     }
@@ -343,8 +394,15 @@ int main(int argc, char** argv) {
         closeSocket(clientSocket);
         continue;
       }
+      const bool duplicate = std::any_of(clients.begin(), clients.end(),
+          [&name](const auto& item) { return item->connected && item->name == name; });
+      if (duplicate) {
+        sendLine(client, "EVENT\tERROR\tNAME_ALREADY_TAKEN");
+        closeSocket(clientSocket);
+        continue;
+      }
       client->player = static_cast<int>(clients.size());
-      client->name = sanitize(parts[1]);
+      client->name = name;
       clients.push_back(client);
 #ifdef _WIN32
       const DWORD noTimeout = 0;

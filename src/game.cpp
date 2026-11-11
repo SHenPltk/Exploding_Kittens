@@ -434,6 +434,10 @@ ActionResult Game::chooseDefusePosition(int player, std::size_t positionFromTop)
 
 ActionResult Game::declineDefuse(int player) {
   if (phase_ != Phase::Kitten || player != kittenPlayer_) return reject("NO_KITTEN_PROMPT");
+  if (std::any_of(players_[player].hand.begin(), players_[player].hand.end(),
+                  [](const Card& card) { return card.type == CardType::Defuse; })) {
+    return reject("DEFUSE_REQUIRED");
+  }
   eliminate(player, kitten_);
   kittenPlayer_ = -1;
   return accept("PLAYER_EXPLODED");

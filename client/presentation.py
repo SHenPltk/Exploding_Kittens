@@ -41,6 +41,9 @@ class PlayerView:
 class State:
     phase: str = "LOBBY"
     sequence: int = 0
+    round_number: int = 0
+    host_player: int = 0
+    connected_count: int | None = None
     active_player: int = -1
     turns_remaining: int = 0
     draw_count: int = 0

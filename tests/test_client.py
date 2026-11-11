@@ -225,6 +225,59 @@ class AppTests(unittest.TestCase):
             self.assertEqual(choose.call_args.args[2], [(4, "拆除"), (9, "拆除")])
             send.assert_called_once_with("FAVOR", 9)
 
+    def test_defuse_prompt_has_no_decline_action(self):
+        self.snapshot(["1:DEFUSE"], phase="KITTEN")
+        self.app._handle("ENDSTATE", [])
+        self.assertFalse(hasattr(self.app, "decline_button"))
+        self.assertFalse(self.app.resolve_button.instate(["disabled"]))
+        self.assertTrue(self.app.restart_button.instate(["disabled"]))
+        with patch.object(self.app, "_choose_position", return_value=0), \
+             patch.object(self.app.connection, "send") as send:
+            self.app._resolve_prompt()
+            send.assert_called_once_with("DEFUSE", 0)
+
+    def test_restart_button_is_only_available_for_online_host_after_game(self):
+        self.snapshot(["1:DEFUSE"], phase="GAME_OVER")
+        self.app._handle("ROUND", ["1"])
+        self.app._handle("SESSION", ["0", "2"])
+        self.app._handle("ENDSTATE", [])
+        self.assertFalse(self.app.restart_button.instate(["disabled"]))
+        with patch.object(self.app.connection, "send") as send:
+            self.app.restart_button.invoke()
+            send.assert_called_once_with("RESTART")
+        self.app.language_name.set("English")
+        self.app._change_language()
+        self.assertEqual(self.app.restart_button.cget("text"), "Restart game")
+        for player, connected, phase, running in ((1, 2, "GAME_OVER", True),
+                                                  (0, 1, "GAME_OVER", True),
+                                                  (0, 2, "TURN", True),
+                                                  (0, 2, "GAME_OVER", False)):
+            self.app.player_id = player
+            self.app.state.connected_count = connected
+            self.app.state.phase = phase
+            self.app.connection.running = running
+            self.app._update_controls()
+            self.assertTrue(self.app.restart_button.instate(["disabled"]))
+
+    def test_new_round_clears_selection_and_highlights_even_for_reused_ids(self):
+        self.snapshot(["1:DEFUSE"])
+        self.app._handle("ROUND", ["1"])
+        self.app._handle("ENDSTATE", [])
+        self.snapshot(["1:DEFUSE", "2:ATTACK"])
+        self.app._handle("ROUND", ["1"])
+        self.app._handle("ENDSTATE", [])
+        self.app._card_widgets[2].invoke()
+        self.assertEqual(self.app.selected_cards, [2])
+        self.assertTrue(self.app.highlights.deadlines)
+        self.snapshot(["2:ATTACK", "3:DEFUSE"])
+        self.app._handle("ROUND", ["2"])
+        self.app._handle("ENDSTATE", [])
+        self.assertEqual(self.app.selected_cards, [])
+        self.assertEqual(self.app.highlights.deadlines, {})
+        self.assertEqual(self.app._highlight_jobs, set())
+        self.assertEqual(self.app.gain_info.cget("text"), "")
+        self.assertEqual(self.app.state.round_number, 2)
+
     def test_real_card_picker_shows_duplicate_names_without_ids(self):
         observed = {}
 
