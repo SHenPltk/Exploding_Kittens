@@ -23,6 +23,8 @@ The C++ host listens on TCP port 8765 by default. Messages are UTF-8, one line e
 - `WELCOME player_id`
 - `ROSTER player_id name ...`
 - `STATE sequence phase active_player turns_remaining draw_count discard_count winner pending_type pending_actor pending_target nope_count response_leader`
+- `DECK bomb_count` (public; count only in the current draw pile)
+- `PENDING original_actor TYPE ...` (public; sent only in RESPONSE, including all original combo card types)
 - `PLAYER player_id name alive hand_count exploded_card_or_dash`
 - `DISCARD card_id:TYPE` (public; repeated for the complete discard pile)
 - `HAND card_id:TYPE ...` (private to that connection)
@@ -31,4 +33,10 @@ The C++ host listens on TCP port 8765 by default. Messages are UTF-8, one line e
 - `ENDSTATE`
 - `PONG`
 
-The draw pile, other players' hands, Defuse insertion position, and See the Future result are never broadcast outside the owning player. The server validates every command again even if the GUI disabled the corresponding button.
+A snapshot starts with STATE and ends with ENDSTATE. Clients assemble it before updating the visible hand. DECK counts only bombs physically in the draw pile: drawing a Kitten reduces it immediately; Defuse reinsertion restores it. The client displays bomb_count / draw_count as a deck-ratio probability (undefined when draw_count is zero), not as a guarantee about a known top card. PENDING includes the original played types throughout a Nope chain; STATE response_leader and nope_count identify the latest Nope and the current action parity.
+
+Card ids are protocol identifiers; the UI shows card names only. Language and hand sorting are client-side presentation and do not change protocol card type names. The protocol calls See the Future SEE_FUTURE.
+
+A single Cat card is rejected with CAT_CARDS_REQUIRE_COMBO without modifying the hand, discard pile, or phase. Two and three matching Cat cards remain valid combos.
+
+The complete draw-pile order, other players' hands, Defuse insertion position, and See the Future result are never broadcast outside the owning player. The server validates every command again even if the GUI disabled the corresponding button.

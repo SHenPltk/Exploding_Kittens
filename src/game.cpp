@@ -134,6 +134,11 @@ void Game::setupHands() {
 
 void Game::shuffleDraw() { std::shuffle(drawPile_.begin(), drawPile_.end(), rng_); }
 
+int Game::bombCount() const {
+  return static_cast<int>(std::count_if(drawPile_.begin(), drawPile_.end(),
+      [](const Card& card) { return card.type == CardType::ExplodingKitten; }));
+}
+
 ActionResult Game::start() {
   if (phase_ != Phase::Lobby) return reject("GAME_ALREADY_STARTED");
   buildDeck();
@@ -198,6 +203,7 @@ ActionResult Game::playCard(int player, int cardId, int target) {
   std::size_t index = 0;
   if (!ownsCard(player, cardId, &index)) return reject("CARD_NOT_IN_HAND");
   const Card card = players_[player].hand[index];
+  if (isCat(card.type)) return reject("CAT_CARDS_REQUIRE_COMBO");
   if (card.type == CardType::Defuse || card.type == CardType::ExplodingKitten ||
       card.type == CardType::Nope) {
     return reject("CARD_CANNOT_BE_PLAYED_NOW");
@@ -347,6 +353,7 @@ ActionResult Game::resolvePending() {
     return accept("ATTACK_RESOLVED");
   }
   if (action.type == "SKIP") {
+    phase_ = Phase::Turn;
     finishOneTurn();
     return accept("SKIP_RESOLVED");
   }

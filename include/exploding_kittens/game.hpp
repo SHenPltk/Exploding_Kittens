@@ -52,11 +52,13 @@ class Game {
   int turnsRemaining() const { return turnsRemaining_; }
   int winner() const { return winner_; }
   int drawCount() const { return static_cast<int>(drawPile_.size()); }
+  int bombCount() const;
   int discardCount() const { return static_cast<int>(discardPile_.size()); }
   const std::vector<Player>& players() const { return players_; }
   const std::vector<Card>& drawPile() const { return drawPile_; }
   const std::vector<Card>& discardPile() const { return discardPile_; }
   const std::string& pendingType() const { return pending_.type; }
+  const std::vector<Card>& pendingCards() const { return pending_.cards; }
   int pendingActor() const { return pending_.actor; }
   int pendingTarget() const { return phase_ == Phase::Favor ? favorTarget_ : pending_.target; }
   int pendingNopeCount() const { return pending_.nopeCount; }

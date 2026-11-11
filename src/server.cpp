@@ -128,6 +128,15 @@ void sendSnapshotLocked() {
           << game->pendingActor() << '\t' << game->pendingTarget() << '\t'
           << game->pendingNopeCount() << '\t' << game->responseLeader();
     sendLine(client, state.str());
+    sendLine(client, "DECK\t" + std::to_string(game->bombCount()));
+    if (game->phase() == ek::Phase::Response) {
+      std::ostringstream pending;
+      pending << "PENDING\t" << game->pendingActor();
+      for (const auto& card : game->pendingCards()) {
+        pending << '\t' << ek::cardTypeName(card.type);
+      }
+      sendLine(client, pending.str());
+    }
     for (const auto& player : game->players()) {
       sendLine(client, "PLAYER\t" + std::to_string(player.id) + "\t" +
                            sanitize(player.name) + "\t" + (player.alive ? "1" : "0") +
