@@ -51,6 +51,11 @@ class State:
     connected_count: int | None = None
     fast_mode: bool = False
     next_fast_mode: bool = False
+    free_attack_mode: bool = False
+    next_free_attack_mode: bool = False
+    prompt_player: int = -1
+    requested_card: str | None = None
+    online_players: list[int] | None = None
     active_player: int = -1
     turns_remaining: int = 0
     draw_count: int = 0
@@ -128,6 +133,8 @@ def response_description(state: State, language: str) -> str:
     if state.pending_target >= 0:
         result += text(language, "response_target",
                        target=state.player_name(state.pending_target, language))
+    if state.pending_type == "COMBO3" and state.requested_card:
+        result += text(language, "response_requested", card=card_name(language, state.requested_card))
     if state.pending_nopes:
         result += text(language, "response_nope",
                        player=state.player_name(state.response_leader, language),

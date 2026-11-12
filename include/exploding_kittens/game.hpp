@@ -35,7 +35,7 @@ struct ActionResult {
 class Game {
  public:
   Game(std::vector<std::string> names, std::uint32_t seed = 1);
-  ActionResult start(bool fastMode = false);
+  ActionResult start(bool fastMode = false, bool freeAttackMode = false);
   ActionResult playCard(int player, int cardId, int target = -1);
   ActionResult playCombo(int player, const std::vector<int>& cardIds, int target = -1,
                          CardType requested = CardType::Defuse);
@@ -46,9 +46,16 @@ class Game {
   ActionResult chooseDefusePosition(int player, std::size_t positionFromTop);
   ActionResult declineDefuse(int player);
   ActionResult forfeit(int player);
+  // Admin-created Kittens trigger immediately without entering the draw pile.
+  // Defuse discards them and consumes no additional turn.
+  ActionResult adminAddCard(int player, CardType type);
+  // Consume one active turn before injecting a Kitten at the chosen alive player.
+  ActionResult adminEndTurnWithKitten(int target);
 
   Phase phase() const { return phase_; }
   bool fastMode() const { return fastMode_; }
+  bool freeAttackMode() const { return freeAttackMode_; }
+  int kittenPlayer() const { return phase_ == Phase::Kitten ? kittenPlayer_ : -1; }
   int activePlayer() const { return activePlayer_; }
   int turnsRemaining() const { return turnsRemaining_; }
   int winner() const { return winner_; }
@@ -63,6 +70,10 @@ class Game {
   int pendingActor() const { return pending_.actor; }
   int pendingTarget() const { return phase_ == Phase::Favor ? favorTarget_ : pending_.target; }
   int pendingNopeCount() const { return pending_.nopeCount; }
+  std::optional<CardType> pendingRequestedCard() const {
+    return phase_ == Phase::Response && pending_.type == "COMBO3"
+        ? std::optional<CardType>{pending_.requested} : std::nullopt;
+  }
   int responseLeader() const { return phase_ == Phase::Response ? pending_.responseLeader : -1; }
   const std::vector<Card>& hand(int player) const { return players_.at(player).hand; }
 
@@ -84,7 +95,8 @@ class Game {
   Phase phase_ = Phase::Lobby;
   Pending pending_;
   int activePlayer_ = 0, turnsRemaining_ = 1, winner_ = -1, nextCardId_ = 1;
-  bool activeUnderAttack_ = false, fastMode_ = false;
+  bool activeUnderAttack_ = false, fastMode_ = false, freeAttackMode_ = false;
+  bool kittenFromDraw_ = false;
   int kittenPlayer_ = -1, favorActor_ = -1, favorTarget_ = -1;
   Card kitten_;
 
@@ -101,6 +113,7 @@ class Game {
   void finishOneTurn();
   void moveToNextPlayer();
   void eliminate(int player, const Card& kitten);
+  ActionResult encounterKitten(int player, const Card& kitten, bool fromDraw);
   ActionResult resolvePending();
   ActionResult reject(const std::string& message) const;
   ActionResult accept(const std::string& message) const;

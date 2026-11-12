@@ -7,3 +7,5 @@ __pycache__/
 *.pyc
 .venv/
 *.log
+server_admin.auth
+server_admin.auth.*

@@ -143,7 +143,7 @@ int Game::bombCount() const {
       [](const Card& card) { return card.type == CardType::ExplodingKitten; }));
 }
 
-ActionResult Game::start(bool fastMode) {
+ActionResult Game::start(bool fastMode, bool freeAttackMode) {
   if (phase_ != Phase::Lobby) return reject("GAME_ALREADY_STARTED");
   if (fastMode && players_.size() > 3) {
     return reject("FAST_MODE_REQUIRES_2_OR_3_PLAYERS");
@@ -155,6 +155,7 @@ ActionResult Game::start(bool fastMode) {
   activeUnderAttack_ = false;
   phase_ = Phase::Turn;
   fastMode_ = fastMode;
+  freeAttackMode_ = freeAttackMode;
   return accept("GAME_STARTED");
 }
 
@@ -219,7 +220,11 @@ ActionResult Game::playCard(int player, int cardId, int target) {
   if (card.type == CardType::Favor && (!isAlive(target) || target == player)) {
     return reject("FAVOR_REQUIRES_OTHER_PLAYER");
   }
-  if (card.type != CardType::Favor && target != -1) return reject("UNEXPECTED_TARGET");
+  if (card.type == CardType::Attack && freeAttackMode_) {
+    if (!isAlive(target) || target == player) return reject("ATTACK_REQUIRES_OTHER_PLAYER");
+  } else if (card.type != CardType::Favor && target != -1) {
+    return reject("UNEXPECTED_TARGET");
+  }
   pending_ = Pending{};
   pending_.active = true;
   pending_.type = cardTypeName(card.type);
@@ -271,24 +276,51 @@ ActionResult Game::draw(int player) {
   if (drawPile_.empty()) return reject("DRAW_PILE_EMPTY");
   const Card card = drawPile_.back();
   drawPile_.pop_back();
-  if (card.type == CardType::ExplodingKitten) {
-    kittenPlayer_ = player;
-    kitten_ = card;
-    players_[player].exploded = card;
-    const bool hasDefuse = std::any_of(
-        players_[player].hand.begin(), players_[player].hand.end(),
-        [](const Card& item) { return item.type == CardType::Defuse; });
-    if (!hasDefuse) {
-      eliminate(player, card);
-      kittenPlayer_ = -1;
-      return accept("PLAYER_EXPLODED");
-    }
-    phase_ = Phase::Kitten;
-    return accept("EXPLODING_KITTEN_DRAWN");
-  }
+  if (card.type == CardType::ExplodingKitten) return encounterKitten(player, card, true);
   players_[player].hand.push_back(card);
   finishOneTurn();
   return accept("CARD_DRAWN");
+}
+
+ActionResult Game::encounterKitten(int player, const Card& kitten, bool fromDraw) {
+  kittenPlayer_ = player;
+  kitten_ = kitten;
+  kittenFromDraw_ = fromDraw;
+  players_[player].exploded = kitten;
+  const bool hasDefuse = std::any_of(
+      players_[player].hand.begin(), players_[player].hand.end(),
+      [](const Card& item) { return item.type == CardType::Defuse; });
+  if (!hasDefuse) {
+    eliminate(player, kitten);
+    kittenPlayer_ = -1;
+    kittenFromDraw_ = false;
+    return accept("PLAYER_EXPLODED");
+  }
+  phase_ = Phase::Kitten;
+  return accept("EXPLODING_KITTEN_DRAWN");
+}
+
+ActionResult Game::adminAddCard(int player, CardType type) {
+  if (phase_ == Phase::Lobby) return reject("GAME_NOT_STARTED");
+  if (phase_ == Phase::GameOver) return reject("GAME_OVER");
+  if (!isAlive(player)) return reject("INVALID_PLAYER");
+  if (cardTypeName(type) == "UNKNOWN") return reject("INVALID_CARD_TYPE");
+  if (type == CardType::ExplodingKitten && phase_ != Phase::Turn) {
+    return reject("ADMIN_ACTION_REQUIRES_TURN");
+  }
+  const Card card{nextCardId_++, type};
+  if (type == CardType::ExplodingKitten) return encounterKitten(player, card, false);
+  players_[player].hand.push_back(card);
+  return accept("ADMIN_CARD_ADDED");
+}
+
+ActionResult Game::adminEndTurnWithKitten(int target) {
+  if (phase_ == Phase::Lobby) return reject("GAME_NOT_STARTED");
+  if (phase_ == Phase::GameOver) return reject("GAME_OVER");
+  if (phase_ != Phase::Turn) return reject("ADMIN_ACTION_REQUIRES_TURN");
+  if (!isAlive(target)) return reject("INVALID_PLAYER");
+  finishOneTurn();
+  return encounterKitten(target, Card{nextCardId_++, CardType::ExplodingKitten}, false);
 }
 
 void Game::finishOneTurn() {
@@ -315,8 +347,10 @@ void Game::eliminate(int player, const Card& kitten) {
   if (aliveCount() <= 1) {
     phase_ = Phase::GameOver;
     for (const Player& item : players_) if (item.alive) winner_ = item.id;
-  } else {
+  } else if (player == activePlayer_) {
     moveToNextPlayer();
+  } else {
+    phase_ = Phase::Turn;
   }
 }
 
@@ -352,9 +386,13 @@ ActionResult Game::resolvePending() {
     phase_ = Phase::Turn;
     return accept("ACTION_CANCELLED_BY_NOPE");
   }
+  if (action.target != -1 && !isAlive(action.target)) {
+    phase_ = Phase::Turn;
+    return accept("ACTION_TARGET_UNAVAILABLE");
+  }
   if (action.type == "ATTACK") {
     const int nextTurns = activeUnderAttack_ ? turnsRemaining_ + 2 : 2;
-    activePlayer_ = nextAlive(action.actor);
+    activePlayer_ = freeAttackMode_ ? action.target : nextAlive(action.actor);
     turnsRemaining_ = nextTurns;
     activeUnderAttack_ = true;
     phase_ = Phase::Turn;
@@ -431,12 +469,19 @@ ActionResult Game::chooseDefusePosition(int player, std::size_t positionFromTop)
   if (defuse == players_[player].hand.end()) return reject("DEFUSE_NOT_AVAILABLE");
   addDiscard(*defuse);
   players_[player].hand.erase(defuse);
-  const auto insertAt = drawPile_.end() - static_cast<std::ptrdiff_t>(positionFromTop);
-  drawPile_.insert(insertAt, kitten_);
+  const bool finishTurn = kittenFromDraw_;
+  if (kittenFromDraw_) {
+    const auto insertAt = drawPile_.end() - static_cast<std::ptrdiff_t>(positionFromTop);
+    drawPile_.insert(insertAt, kitten_);
+  } else {
+    // An injected Kitten never enters the draw pile, even after Defuse.
+    addDiscard(kitten_);
+  }
   players_[player].exploded.reset();
   kittenPlayer_ = -1;
+  kittenFromDraw_ = false;
   phase_ = Phase::Turn;
-  finishOneTurn();
+  if (finishTurn) finishOneTurn();
   return accept("KITTEN_DEFUSED");
 }
 
@@ -448,6 +493,7 @@ ActionResult Game::declineDefuse(int player) {
   }
   eliminate(player, kitten_);
   kittenPlayer_ = -1;
+  kittenFromDraw_ = false;
   return accept("PLAYER_EXPLODED");
 }
 
@@ -469,6 +515,16 @@ ActionResult Game::forfeit(int player) {
       return accept("DISCONNECTED_ACTION_CANCELLED");
     }
     players_[player].alive = false;
+    if (player == pending_.target) {
+      for (const Card& card : pending_.cards) addDiscard(card);
+      pending_ = Pending{};
+      phase_ = Phase::Turn;
+      if (aliveCount() <= 1) {
+        phase_ = Phase::GameOver;
+        for (const Player& item : players_) if (item.alive) winner_ = item.id;
+      }
+      return accept("ACTION_TARGET_UNAVAILABLE");
+    }
     if (player == pending_.responseLeader) {
       pending_.responseLeader = pending_.actor;
       pending_.responded.erase(pending_.actor);
@@ -486,8 +542,10 @@ ActionResult Game::forfeit(int player) {
   if (phase_ == Phase::Kitten && player == kittenPlayer_) {
     eliminate(player, kitten_);
     kittenPlayer_ = -1;
+    kittenFromDraw_ = false;
     return accept("DISCONNECTED_PLAYER_EXPLODED");
   }
+  const bool kittenPending = phase_ == Phase::Kitten;
   const bool ownedTurn = player == activePlayer_;
   players_[player].alive = false;
   if (phase_ == Phase::Favor && (player == favorActor_ || player == favorTarget_)) {
@@ -495,11 +553,18 @@ ActionResult Game::forfeit(int player) {
     phase_ = Phase::Turn;
   }
   if (aliveCount() <= 1) {
+    if (kittenPending) {
+      addDiscard(kitten_);
+      players_[kittenPlayer_].exploded.reset();
+      kittenPlayer_ = -1;
+      kittenFromDraw_ = false;
+    }
     phase_ = Phase::GameOver;
     for (const Player& item : players_) if (item.alive) winner_ = item.id;
   } else if (ownedTurn) {
     activePlayer_ = player;
     moveToNextPlayer();
+    if (kittenPending) phase_ = Phase::Kitten;
   }
   return accept("DISCONNECTED_PLAYER_FORFEITED");
 }

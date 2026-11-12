@@ -227,7 +227,7 @@ class AppTests(unittest.TestCase):
         self.app.player_id = 1
         with patch.object(self.app, "_choose", return_value=9) as choose, \
              patch.object(self.app.connection, "send") as send:
-            self.app._resolve_prompt()
+            self.app._open_auto_prompt()
             self.assertEqual(choose.call_args.args[2], [(4, "拆除"), (9, "拆除")])
             send.assert_called_once_with("FAVOR", 9)
 
@@ -315,11 +315,12 @@ class AppTests(unittest.TestCase):
         self.snapshot(["1:DEFUSE"], phase="KITTEN")
         self.app._handle("ENDSTATE", [])
         self.assertFalse(hasattr(self.app, "decline_button"))
-        self.assertFalse(self.app.resolve_button.instate(["disabled"]))
+        self.assertFalse(hasattr(self.app, "resolve_button"))
+        self.assertIsNotNone(self.app._auto_prompt_job)
         self.assertTrue(self.app.restart_button.instate(["disabled"]))
         with patch.object(self.app, "_choose_position", return_value=0), \
              patch.object(self.app.connection, "send") as send:
-            self.app._resolve_prompt()
+            self.app._open_auto_prompt()
             send.assert_called_once_with("DEFUSE", 0)
 
     def test_restart_button_is_only_available_for_online_host_after_game(self):
@@ -384,6 +385,112 @@ class AppTests(unittest.TestCase):
         self.assertEqual(result, 9)
         self.assertEqual(observed["labels"], ("拆除", "拆除"))
         self.assertEqual(observed["buttons"], ["确定", "取消"])
+
+    def test_nope_button_automatically_uses_a_card_without_selection(self):
+        self.snapshot(["7:NOPE", "3:NOPE", "1:DEFUSE"], phase="RESPONSE", pending_type="ATTACK", leader=1)
+        self.app._handle("ENDSTATE", [])
+        self.assertEqual(self.app.selected_cards, [])
+        self.assertFalse(self.app.nope_button.instate(["disabled"]))
+        with patch.object(self.app.connection, "send") as send:
+            self.app.nope_button.invoke()
+            send.assert_called_once_with("NOPE", 3)
+
+    def test_triple_request_is_public_and_survives_language_switch(self):
+        self.snapshot(["1:DEFUSE"], phase="RESPONSE", pending_type="COMBO3", cards=["ATTACK"] * 3)
+        self.app._handle("REQUESTED", ["DEFUSE"])
+        self.app._handle("ENDSTATE", [])
+        self.assertIn("公开索要：拆除", self.app.response_info.cget("text"))
+        self.app.language_name.set("English")
+        self.app._change_language()
+        self.assertIn("requested card: Defuse", self.app.response_info.cget("text"))
+
+    def test_free_attack_targets_and_host_options(self):
+        self.snapshot(["2:ATTACK"])
+        self.app._handle("MODE", ["0", "1"])
+        self.app._handle("OPTIONS", ["0", "1"])
+        self.app._handle("ENDSTATE", [])
+        self.app.selected_cards = [2]
+        with patch.object(self.app, "_target", return_value=1), patch.object(self.app.connection, "send") as send:
+            self.app._play_selected()
+            send.assert_called_once_with("PLAY", 2, 1)
+        self.app.state.phase = "LOBBY"
+        self.app._update_controls()
+        with patch.object(self.app.connection, "send") as send:
+            self.app.free_attack_button.invoke()
+            send.assert_called_once_with("SET_FREE_ATTACK", 0)
+        self.app.player_id = 1
+        self.app._update_controls()
+        self.assertTrue(self.app.free_attack_button.instate(["disabled"]))
+
+    def test_kick_uses_online_targets_and_host_can_differ_from_player_zero(self):
+        self.app.state.host_player = 1
+        self.app.player_id = 1
+        self.app.state.online_players = [0, 1]
+        self.app._update_controls()
+        self.assertFalse(self.app.kick_button.instate(["disabled"]))
+        self.assertFalse(self.app.start_button.instate(["disabled"]))
+        with patch.object(self.app, "_choose", return_value=0), patch.object(self.app.connection, "send") as send:
+            self.app.kick_button.invoke()
+            send.assert_called_once_with("KICK", 0)
+
+    def test_injected_bomb_prompt_opens_for_target_not_active_player(self):
+        self.app.player_id = 1
+        self.snapshot(["1:DEFUSE"], phase="KITTEN")
+        self.app._handle("PROMPT", ["1"])
+        self.app._handle("ENDSTATE", [])
+        self.assertEqual(self.app._current_prompt_key(), (0, "KITTEN", 1))
+        with patch.object(self.app, "_choose_position", return_value=0) as choose, \
+             patch.object(self.app.connection, "send") as send:
+            self.app._open_auto_prompt()
+            choose.assert_called_once_with(required=True)
+            send.assert_called_once_with("DEFUSE", 0)
+            self.app._schedule_prompt()
+            self.assertIsNone(self.app._auto_prompt_job)
+
+    def test_real_automatic_defuse_dialog_uses_required_prompt_without_button(self):
+        self.snapshot(["1:DEFUSE"], phase="KITTEN")
+        self.app._handle("ENDSTATE", [])
+        observed = {}
+
+        def accept_dialog():
+            dialog = self.app._prompt_dialog
+            observed["title"] = dialog.title()
+            controls = dialog.winfo_children()[2]
+            observed["labels"] = [button.cget("text") for button in controls.winfo_children()]
+            controls.winfo_children()[0].invoke()
+
+        self.app.after(20, accept_dialog)
+        with patch.object(self.app.connection, "send") as send:
+            self.app._open_auto_prompt()
+            send.assert_called_once_with("DEFUSE", 0)
+        self.assertEqual(observed["labels"], ["确定"])
+        self.assertIn("拆除", observed["title"])
+        self.assertFalse(hasattr(self.app, "resolve_button"))
+        self.assertIsNone(self.app._prompt_dialog)
+
+    def test_narrow_layout_and_keyboard_mouse_scroll(self):
+        self.app.deiconify()
+        self.app.geometry("480x800")
+        self.app.update()
+        self.app.state.hand = [(i + 1, "DEFUSE") for i in range(60)]
+        self.app._render()
+        self.app.update()
+        self.assertLessEqual(self.app.minsize()[0], 480)
+        self.assertEqual(int(self.app.hand_box.grid_info()["row"]), 1)
+        self.assertEqual(len({int(button.grid_info()["row"]) for button in self.app._action_buttons}), 4)
+        top = self.app.hand_canvas.yview()[0]
+        self.app._scroll_hand_units(3)
+        self.app.update()
+        self.assertGreater(self.app.hand_canvas.yview()[0], top)
+        self.app._card_widgets[1].focus_force()
+        self.app._card_widgets[1].event_generate("<Down>")
+        self.app.update()
+        after_down = self.app.hand_canvas.yview()[0]
+        self.app._scroll_hand(type("Event", (), {"delta": -120})())
+        self.app.update()
+        self.assertGreater(self.app.hand_canvas.yview()[0], after_down)
+        for button in self.app._action_buttons:
+            self.assertLessEqual(button.winfo_x() + button.winfo_width(), self.app.controls.winfo_width())
 
     def test_defuse_position_dialog_has_localized_buttons(self):
         observed = {}

@@ -17,12 +17,13 @@ using namespace ek;
 } } while (false)
 
 std::unique_ptr<Game> findGame(const std::function<bool(const Game&)>& predicate,
-                               int playerCount = 2, bool fastMode = false) {
+                               int playerCount = 2, bool fastMode = false,
+                               bool freeAttackMode = false) {
   std::vector<std::string> names;
   for (int i = 0; i < playerCount; ++i) names.push_back("P" + std::to_string(i));
   for (std::uint32_t seed = 1; seed < 10000; ++seed) {
     auto game = std::make_unique<Game>(names, seed);
-    CHECK(game->start(fastMode).ok);
+    CHECK(game->start(fastMode, freeAttackMode).ok);
     if (predicate(*game)) return game;
   }
   throw std::runtime_error("could not find a deterministic test deal");
@@ -54,11 +55,13 @@ void checkCards(const std::vector<Card>& actual, const std::vector<Card>& expect
 std::string publicState(const Game& game) {
   std::ostringstream state;
   state << phaseName(game.phase()) << ':' << game.fastMode() << ':'
+        << game.freeAttackMode() << ':' << game.kittenPlayer() << ':'
         << game.activePlayer() << ':'
         << game.turnsRemaining() << ':' << game.winner() << ':'
         << game.drawCount() << ':' << game.bombCount() << ':' << game.discardCount() << ':'
         << game.pendingType() << ':' << game.pendingActor() << ':' << game.pendingTarget()
-        << ':' << game.pendingNopeCount() << ':' << game.responseLeader();
+        << ':' << game.pendingNopeCount() << ':' << game.responseLeader() << ':';
+  if (game.pendingRequestedCard()) state << cardTypeName(*game.pendingRequestedCard());
   const auto appendCards = [&state](const std::vector<Card>& cards) {
     state << '[';
     for (const Card& card : cards) state << card.id << ':' << cardTypeName(card.type) << ',';
@@ -83,6 +86,8 @@ void checkPending(const Game& game, const std::string& type, int actor, int targ
   CHECK(game.pendingTarget() == target);
   CHECK(game.pendingNopeCount() == nopeCount);
   CHECK(game.responseLeader() == responseLeader);
+  CHECK(game.pendingRequestedCard() == (type == "COMBO3"
+      ? std::optional<CardType>{CardType::Defuse} : std::nullopt));
   checkCards(game.pendingCards(), cards);
 }
 
@@ -93,6 +98,7 @@ void checkPendingCleared(const Game& game) {
   CHECK(game.pendingTarget() == -1);
   CHECK(game.pendingNopeCount() == 0);
   CHECK(game.responseLeader() == -1);
+  CHECK(!game.pendingRequestedCard().has_value());
 }
 
 void checkBombCount(const Game& game) {
@@ -745,6 +751,612 @@ void testInvalidActions() {
   CHECK(publicState(game) == turnState);
 }
 
+void passResponses(Game& game) {
+  CHECK(game.phase() == Phase::Response);
+  const int leader = game.responseLeader();
+  for (const Player& player : game.players()) {
+    if (player.alive && player.id != leader) CHECK(game.respondPass(player.id).ok);
+  }
+  CHECK(game.phase() != Phase::Response);
+}
+
+Card addCard(Game& game, int player, CardType type) {
+  const auto deck = game.drawPile();
+  const auto size = game.hand(player).size();
+  CHECK(game.adminAddCard(player, type).ok);
+  CHECK(game.hand(player).size() == size + 1);
+  const Card card = game.hand(player).back();
+  CHECK(card.type == type);
+  checkCards(game.drawPile(), deck);
+  return card;
+}
+
+void rejectUnchanged(Game& game, const std::function<ActionResult()>& action,
+                     const std::string& message) {
+  const auto before = publicState(game);
+  const ActionResult result = action();
+  CHECK(!result.ok);
+  CHECK(result.message == message);
+  CHECK(result.privatePlayer == -1);
+  CHECK(result.privateCards.empty());
+  CHECK(publicState(game) == before);
+}
+
+std::set<int> uniqueCardIds(const Game& game) {
+  std::set<int> ids;
+  const auto append = [&ids](const std::vector<Card>& cards) {
+    for (const Card& card : cards) CHECK(ids.insert(card.id).second);
+  };
+  append(game.drawPile());
+  append(game.discardPile());
+  append(game.pendingCards());
+  for (const Player& player : game.players()) append(player.hand);
+  if (game.kittenPlayer() >= 0) {
+    const auto& kitten = game.players()[game.kittenPlayer()].exploded;
+    CHECK(kitten.has_value());
+    CHECK(ids.insert(kitten->id).second);
+  }
+  return ids;
+}
+
+void attack(Game& game, int target) {
+  const int actor = game.activePlayer();
+  const auto card = addCard(game, actor, CardType::Attack);
+  CHECK(game.playCard(actor, card.id, game.freeAttackMode() ? target : -1).ok);
+  passResponses(game);
+  CHECK(game.activePlayer() == target);
+}
+
+void testFreeAttackConfigurationAndValidation() {
+  for (int count = 2; count <= 5; ++count) {
+    for (bool fast : {false, true}) {
+      if (fast && count > 3) continue;
+      std::vector<std::string> names;
+      for (int i = 0; i < count; ++i) names.push_back("P" + std::to_string(i));
+      Game standard(names, 401), explicitStandard(names, 401), free(names, 401);
+      CHECK(!free.freeAttackMode());
+      CHECK(free.kittenPlayer() == -1);
+      CHECK(!free.pendingRequestedCard());
+      CHECK(standard.start(fast).ok);
+      CHECK(explicitStandard.start(fast, false).ok);
+      CHECK(publicState(standard) == publicState(explicitStandard));
+      CHECK(free.start(fast, true).ok);
+      CHECK(free.freeAttackMode());
+      CHECK(free.fastMode() == fast);
+      checkCards(free.drawPile(), standard.drawPile());
+      for (int player = 0; player < count; ++player) {
+        checkCards(free.hand(player), standard.hand(player));
+      }
+      rejectUnchanged(free, [&] { return free.start(!fast, false); }, "GAME_ALREADY_STARTED");
+      CHECK(free.freeAttackMode());
+    }
+  }
+  Game invalidFast({"A", "B", "C", "D"});
+  rejectUnchanged(invalidFast, [&] { return invalidFast.start(true, true); },
+                  "FAST_MODE_REQUIRES_2_OR_3_PLAYERS");
+  CHECK(!invalidFast.freeAttackMode());
+
+  Game game({"A", "B", "C", "D"}, 91);
+  CHECK(game.start(false, true).ok);
+  const auto card = addCard(game, 0, CardType::Attack);
+  CHECK(game.forfeit(3).ok);
+  for (int target : {-2, -1, 0, 3, 4}) {
+    rejectUnchanged(game, [&] { return game.playCard(0, card.id, target); },
+                    "ATTACK_REQUIRES_OTHER_PLAYER");
+  }
+  CHECK(game.playCard(0, card.id, 2).ok);
+  CHECK(game.pendingTarget() == 2);
+  CHECK(!game.pendingRequestedCard());
+  passResponses(game);
+  CHECK(game.activePlayer() == 2);
+  CHECK(game.turnsRemaining() == 2);
+  for (int turn = 0; turn < 2; ++turn) {
+    const auto skip = addCard(game, 2, CardType::Skip);
+    CHECK(game.playCard(2, skip.id).ok);
+    passResponses(game);
+  }
+  CHECK(game.activePlayer() == 0);  // Clockwise from target, skipping forfeited 3.
+  CHECK(game.turnsRemaining() == 1);
+
+  Game standard({"A", "B", "C"}, 91);
+  CHECK(standard.start().ok);
+  const auto standardAttack = addCard(standard, 0, CardType::Attack);
+  for (int target : {0, 1, 2}) {
+    rejectUnchanged(standard, [&] { return standard.playCard(0, standardAttack.id, target); },
+                    "UNEXPECTED_TARGET");
+  }
+  CHECK(standard.forfeit(1).ok);
+  CHECK(standard.playCard(0, standardAttack.id).ok);
+  CHECK(standard.pendingTarget() == -1);
+  passResponses(standard);
+  CHECK(standard.activePlayer() == 2);
+  CHECK(standard.turnsRemaining() == 2);
+}
+
+void testFreeAttackNopeStackingAndForfeit() {
+  for (bool cancelled : {false, true}) {
+    Game game({"A", "B", "C", "D"}, 54);
+    CHECK(game.start(false, true).ok);
+    attack(game, 2);
+    CHECK(game.turnsRemaining() == 2);
+    const auto skip = addCard(game, 2, CardType::Skip);
+    CHECK(game.playCard(2, skip.id).ok);
+    passResponses(game);
+    CHECK(game.turnsRemaining() == 1);
+    const auto stacked = addCard(game, 2, CardType::Attack);
+    const auto nope0 = addCard(game, 0, CardType::Nope);
+    const auto nope2 = addCard(game, 2, CardType::Nope);
+    CHECK(game.playCard(2, stacked.id, 0).ok);
+    CHECK(game.pendingTarget() == 0);
+    CHECK(game.respondNope(0, nope0.id).ok);
+    CHECK(game.pendingTarget() == 0);
+    if (!cancelled) CHECK(game.respondNope(2, nope2.id).ok);
+    passResponses(game);
+    CHECK(game.turnsRemaining() == (cancelled ? 1 : 3));
+    CHECK(game.activePlayer() == (cancelled ? 2 : 0));
+    checkPendingCleared(game);
+    // A cancelled Attack must preserve the attack status as well as visible debt.
+    const int actor = game.activePlayer();
+    const int target = actor == 2 ? 3 : 1;
+    attack(game, target);
+    CHECK(game.turnsRemaining() == (cancelled ? 3 : 5));
+  }
+
+  for (bool noped : {false, true}) {
+    Game game({"A", "B", "C", "D"}, 32);
+    CHECK(game.start(false, true).ok);
+    attack(game, 2);
+    const auto card = addCard(game, 2, CardType::Attack);
+    const auto nope = addCard(game, 0, CardType::Nope);
+    const auto deck = game.drawPile();
+    CHECK(game.playCard(2, card.id, 0).ok);
+    if (noped) CHECK(game.respondNope(0, nope.id).ok);
+    CHECK(game.forfeit(0).ok);
+    CHECK(game.phase() == Phase::Turn);
+    CHECK(game.activePlayer() == 2);
+    CHECK(game.turnsRemaining() == 2);
+    CHECK(!game.players()[0].alive);
+    checkPendingCleared(game);
+    checkCards(game.drawPile(), deck);
+    attack(game, 3);
+    CHECK(game.turnsRemaining() == 4);
+  }
+
+  Game actorGone({"A", "B", "C", "D"}, 12);
+  CHECK(actorGone.start(false, true).ok);
+  const auto card = addCard(actorGone, 0, CardType::Attack);
+  CHECK(actorGone.playCard(0, card.id, 2).ok);
+  CHECK(actorGone.forfeit(0).ok);
+  CHECK(actorGone.phase() == Phase::Turn);
+  CHECK(actorGone.activePlayer() == 1);
+  CHECK(actorGone.turnsRemaining() == 1);
+  checkPendingCleared(actorGone);
+}
+
+void testDefaultAttackDebtAndFreeTargetForfeit() {
+  Game game({"A", "B", "C"}, 42);
+  CHECK(game.start().ok);
+  attack(game, 1);
+  CHECK(game.turnsRemaining() == 2);
+  attack(game, 2);
+  CHECK(game.turnsRemaining() == 4);
+  for (int turn = 0; turn < 4; ++turn) {
+    const auto skip = addCard(game, 2, CardType::Skip);
+    CHECK(game.playCard(2, skip.id).ok);
+    passResponses(game);
+    CHECK(game.activePlayer() == (turn == 3 ? 0 : 2));
+    CHECK(game.turnsRemaining() == (turn == 3 ? 1 : 3 - turn));
+  }
+  attack(game, 1);
+  CHECK(game.turnsRemaining() == 2);
+
+  Game free({"A", "B", "C"}, 71);
+  CHECK(free.start(false, true).ok);
+  const auto card = addCard(free, 0, CardType::Attack);
+  CHECK(free.playCard(0, card.id, 2).ok);
+  CHECK(free.forfeit(1).ok);  // An unrelated responder must not cancel the target.
+  CHECK(free.phase() == Phase::Response);
+  CHECK(free.pendingTarget() == 2);
+  CHECK(free.respondPass(2).ok);
+  CHECK(free.activePlayer() == 2);
+  CHECK(free.turnsRemaining() == 2);
+
+  Game last({"A", "B"}, 4);
+  CHECK(last.start(false, true).ok);
+  const auto lastAttack = addCard(last, 0, CardType::Attack);
+  CHECK(last.playCard(0, lastAttack.id, 1).ok);
+  CHECK(last.forfeit(1).ok);
+  CHECK(last.phase() == Phase::GameOver);
+  CHECK(last.winner() == 0);
+  CHECK(last.activePlayer() == 0);
+  CHECK(last.turnsRemaining() == 1);
+  checkPendingCleared(last);
+}
+
+void testRequestedCardVisibility() {
+  for (CardType requested : {CardType::Attack, CardType::Nope, CardType::Defuse,
+                             CardType::ExplodingKitten}) {
+    for (bool cancelled : {false, true}) {
+      Game game({"A", "B", "C"}, 72);
+      CHECK(game.start().ok);
+      std::vector<int> ids;
+      for (int i = 0; i < 3; ++i) ids.push_back(addCard(game, 0, CardType::Tacocat).id);
+      const auto nope1 = addCard(game, 1, CardType::Nope);
+      const auto nope0 = addCard(game, 0, CardType::Nope);
+      CHECK(!game.pendingRequestedCard());
+      CHECK(game.playCombo(0, ids, 2, requested).ok);
+      CHECK(game.pendingRequestedCard() == requested);
+      CHECK(game.respondPass(2).ok);
+      CHECK(game.pendingRequestedCard() == requested);
+      CHECK(game.respondNope(1, nope1.id).ok);
+      CHECK(game.pendingRequestedCard() == requested);
+      if (!cancelled) {
+        CHECK(game.respondNope(0, nope0.id).ok);
+        CHECK(game.pendingRequestedCard() == requested);
+      }
+      passResponses(game);
+      checkPendingCleared(game);
+    }
+  }
+  Game game({"A", "B", "C"}, 51);
+  CHECK(game.start().ok);
+  std::vector<int> ids;
+  for (int i = 0; i < 3; ++i) ids.push_back(addCard(game, 0, CardType::BeardCat).id);
+  rejectUnchanged(game, [&] { return game.playCombo(0, ids, 1, static_cast<CardType>(99)); },
+                  "INVALID_REQUESTED_CARD");
+  CHECK(game.playCombo(0, ids, 1, CardType::Skip).ok);
+  CHECK(game.pendingRequestedCard() == CardType::Skip);
+  CHECK(game.forfeit(1).ok);
+  CHECK(game.phase() == Phase::Turn);
+  checkPendingCleared(game);
+}
+
+void testAdminCardsAndValidation() {
+  Game game({"A", "B", "C"}, 81);
+  rejectUnchanged(game, [&] { return game.adminAddCard(0, CardType::Skip); }, "GAME_NOT_STARTED");
+  rejectUnchanged(game, [&] { return game.adminEndTurnWithKitten(0); }, "GAME_NOT_STARTED");
+  CHECK(game.start().ok);
+  const auto deck = game.drawPile();
+  auto ids = uniqueCardIds(game);
+  for (int target : {-1, 3}) {
+    rejectUnchanged(game, [&] { return game.adminAddCard(target, CardType::Attack); }, "INVALID_PLAYER");
+    rejectUnchanged(game, [&] { return game.adminEndTurnWithKitten(target); }, "INVALID_PLAYER");
+  }
+  rejectUnchanged(game, [&] { return game.adminAddCard(0, static_cast<CardType>(99)); },
+                  "INVALID_CARD_TYPE");
+  for (CardType type : {CardType::Defuse, CardType::Attack, CardType::Skip, CardType::SeeFuture,
+                        CardType::Shuffle, CardType::Favor, CardType::Nope, CardType::Tacocat,
+                        CardType::Cattermelon, CardType::HairyPotatoCat,
+                        CardType::RainbowRalphingCat, CardType::BeardCat}) {
+    const int target = static_cast<int>(ids.size() % 3);
+    const auto card = addCard(game, target, type);
+    CHECK(card.id > *ids.rbegin());
+    CHECK(ids.insert(card.id).second);
+    CHECK(uniqueCardIds(game) == ids);
+    CHECK(game.phase() == Phase::Turn);
+    CHECK(game.activePlayer() == 0);
+    CHECK(game.turnsRemaining() == 1);
+    checkCards(game.drawPile(), deck);
+  }
+  CHECK(game.forfeit(2).ok);
+  rejectUnchanged(game, [&] { return game.adminAddCard(2, CardType::Defuse); }, "INVALID_PLAYER");
+  rejectUnchanged(game, [&] { return game.adminEndTurnWithKitten(2); }, "INVALID_PLAYER");
+  CHECK(game.forfeit(1).ok);
+  rejectUnchanged(game, [&] { return game.adminAddCard(0, CardType::Skip); }, "GAME_OVER");
+  rejectUnchanged(game, [&] { return game.adminEndTurnWithKitten(0); }, "GAME_OVER");
+  CHECK(game.kittenPlayer() == -1);
+
+  // Rejected commands must not even consume a synthetic ID or RNG state.
+  Game clean({"A", "B", "C"}, 81), rejected({"A", "B", "C"}, 81);
+  CHECK(clean.start().ok);
+  CHECK(rejected.start().ok);
+  CHECK(!rejected.adminAddCard(-1, CardType::Attack).ok);
+  CHECK(!rejected.adminAddCard(0, static_cast<CardType>(99)).ok);
+  CHECK(!rejected.adminEndTurnWithKitten(3).ok);
+  for (Game* candidate : {&clean, &rejected}) {
+    const auto shuffle = addCard(*candidate, 0, CardType::Shuffle);
+    CHECK(candidate->playCard(0, shuffle.id).ok);
+    passResponses(*candidate);
+  }
+  CHECK(publicState(clean) == publicState(rejected));
+}
+
+void testAdminCardsDuringActivePhases() {
+  Game game({"A", "B", "C"}, 45);
+  CHECK(game.start().ok);
+  const auto deck = game.drawPile();
+  const auto favor = addCard(game, 0, CardType::Favor);
+  CHECK(game.playCard(0, favor.id, 1).ok);
+  CHECK(game.phase() == Phase::Response);
+  const auto pending = game.pendingCards();
+  addCard(game, 2, CardType::Nope);
+  CHECK(game.phase() == Phase::Response);
+  checkCards(game.pendingCards(), pending);
+  rejectUnchanged(game, [&] { return game.adminAddCard(1, CardType::ExplodingKitten); },
+                  "ADMIN_ACTION_REQUIRES_TURN");
+  rejectUnchanged(game, [&] { return game.adminEndTurnWithKitten(1); },
+                  "ADMIN_ACTION_REQUIRES_TURN");
+  passResponses(game);
+  CHECK(game.phase() == Phase::Favor);
+  const auto gift = addCard(game, 1, CardType::Skip);
+  CHECK(game.phase() == Phase::Favor);
+  CHECK(game.pendingTarget() == 1);
+  CHECK(!game.pendingRequestedCard());
+  rejectUnchanged(game, [&] { return game.adminAddCard(1, CardType::ExplodingKitten); },
+                  "ADMIN_ACTION_REQUIRES_TURN");
+  rejectUnchanged(game, [&] { return game.adminEndTurnWithKitten(1); },
+                  "ADMIN_ACTION_REQUIRES_TURN");
+  CHECK(game.chooseFavor(1, gift.id).ok);
+  CHECK(game.adminAddCard(2, CardType::ExplodingKitten).ok);
+  CHECK(game.phase() == Phase::Kitten);
+  CHECK(game.kittenPlayer() == 2);
+  const int kittenId = game.players()[2].exploded->id;
+  addCard(game, 2, CardType::Defuse);
+  CHECK(game.phase() == Phase::Kitten);
+  CHECK(game.kittenPlayer() == 2);
+  CHECK(game.players()[2].exploded->id == kittenId);
+  rejectUnchanged(game, [&] { return game.adminAddCard(1, CardType::ExplodingKitten); },
+                  "ADMIN_ACTION_REQUIRES_TURN");
+  rejectUnchanged(game, [&] { return game.adminEndTurnWithKitten(1); },
+                  "ADMIN_ACTION_REQUIRES_TURN");
+  CHECK(game.chooseDefusePosition(2, deck.size()).ok);
+  CHECK(game.phase() == Phase::Turn);
+  CHECK(game.kittenPlayer() == -1);
+  CHECK(game.activePlayer() == 0);
+  CHECK(game.turnsRemaining() == 1);
+  checkCards(game.drawPile(), deck);
+  uniqueCardIds(game);
+}
+
+void testAdminBombDefuseAndTurnAccounting() {
+  for (bool endTurn : {false, true}) {
+    for (int target : {0, 1, 2}) {
+      Game game({"A", "B", "C"}, 63);
+      CHECK(game.start().ok);
+      const auto deck = game.drawPile();
+      const auto hand = game.hand(target);
+      auto ids = uniqueCardIds(game);
+      const auto defuse = findCards(game, target, CardType::Defuse).front();
+      const int discards = game.discardCount();
+      const ActionResult result = endTurn ? game.adminEndTurnWithKitten(target)
+                                        : game.adminAddCard(target, CardType::ExplodingKitten);
+      CHECK(result.ok);
+      CHECK(game.phase() == Phase::Kitten);
+      CHECK(game.activePlayer() == (endTurn ? 1 : 0));
+      CHECK(game.turnsRemaining() == 1);
+      CHECK(game.kittenPlayer() == target);
+      CHECK(!game.pendingRequestedCard());
+      CHECK(game.players()[target].exploded.has_value());
+      const auto kitten = *game.players()[target].exploded;
+      CHECK(kitten.type == CardType::ExplodingKitten);
+      CHECK(kitten.id > *ids.rbegin());
+      CHECK(ids.insert(kitten.id).second);
+      CHECK(uniqueCardIds(game) == ids);
+      checkCards(game.hand(target), hand);
+      checkCards(game.drawPile(), deck);
+      rejectUnchanged(game, [&] { return game.draw(game.activePlayer()); }, "NOT_IN_TURN");
+      rejectUnchanged(game, [&] { return game.playCard(game.activePlayer(), -1); }, "NOT_IN_TURN");
+      rejectUnchanged(game, [&] { return game.chooseDefusePosition((target + 1) % 3, 0); },
+                      "NO_KITTEN_PROMPT");
+      rejectUnchanged(game, [&] { return game.chooseDefusePosition(target, deck.size() + 1); },
+                      "INVALID_KITTEN_POSITION");
+      rejectUnchanged(game, [&] { return game.declineDefuse(target); }, "DEFUSE_REQUIRED");
+      CHECK(game.chooseDefusePosition(target, static_cast<std::size_t>(target)).ok);
+      CHECK(game.phase() == Phase::Turn);
+      CHECK(game.activePlayer() == (endTurn ? 1 : 0));
+      CHECK(game.turnsRemaining() == 1);
+      CHECK(game.kittenPlayer() == -1);
+      CHECK(!game.players()[target].exploded);
+      CHECK(game.hand(target).size() == hand.size() - 1);
+      CHECK(game.discardCount() == discards + 2);
+      CHECK(game.discardPile()[discards].id == defuse.id);
+      CHECK(game.discardPile().back().id == kitten.id);
+      checkCards(game.drawPile(), deck);
+      CHECK(uniqueCardIds(game) == ids);
+      rejectUnchanged(game, [&] { return game.chooseDefusePosition(target, 0); }, "NO_KITTEN_PROMPT");
+    }
+  }
+}
+
+void exhaustDefuses(Game& game, int player) {
+  const auto deck = game.drawPile();
+  const int actor = game.activePlayer();
+  const int turns = game.turnsRemaining();
+  while (findCard(game, player, CardType::Defuse) >= 0) {
+    CHECK(game.adminAddCard(player, CardType::ExplodingKitten).ok);
+    CHECK(game.kittenPlayer() == player);
+    CHECK(game.chooseDefusePosition(player, 0).ok);
+    CHECK(game.activePlayer() == actor);
+    CHECK(game.turnsRemaining() == turns);
+    checkCards(game.drawPile(), deck);
+  }
+}
+
+void testAdminBombAutomaticExplosion() {
+  for (bool endTurn : {false, true}) {
+    for (int target : {0, 1, 2}) {
+      Game game({"A", "B", "C"}, 21);
+      CHECK(game.start().ok);
+      exhaustDefuses(game, target);
+      const auto deck = game.drawPile();
+      const auto hand = game.hand(target);
+      auto ids = uniqueCardIds(game);
+      const int activeAfterEnd = endTurn ? 1 : 0;
+      const int expectedActive = target == activeAfterEnd ? (target + 1) % 3 : activeAfterEnd;
+      const ActionResult result = endTurn ? game.adminEndTurnWithKitten(target)
+                                        : game.adminAddCard(target, CardType::ExplodingKitten);
+      CHECK(result.ok);
+      CHECK(result.message == "PLAYER_EXPLODED");
+      CHECK(game.phase() == Phase::Turn);
+      CHECK(game.kittenPlayer() == -1);
+      CHECK(!game.players()[target].alive);
+      CHECK(game.players()[target].exploded.has_value());
+      const auto kitten = *game.players()[target].exploded;
+      CHECK(game.discardPile().back().id == kitten.id);
+      CHECK(ids.insert(kitten.id).second);
+      CHECK(uniqueCardIds(game) == ids);
+      CHECK(game.activePlayer() == expectedActive);
+      CHECK(game.turnsRemaining() == 1);
+      checkCards(game.hand(target), hand);
+      checkCards(game.drawPile(), deck);
+    }
+  }
+  Game final({"A", "B"}, 11);
+  CHECK(final.start().ok);
+  exhaustDefuses(final, 0);
+  const auto deck = final.drawPile();
+  CHECK(final.adminEndTurnWithKitten(0).ok);
+  CHECK(final.phase() == Phase::GameOver);
+  CHECK(final.winner() == 1);
+  CHECK(final.kittenPlayer() == -1);
+  checkCards(final.drawPile(), deck);
+}
+
+void testAdminBombAttackDebt() {
+  Game game({"A", "B", "C", "D"}, 33);
+  CHECK(game.start(false, true).ok);
+  attack(game, 2);
+  attack(game, 3);
+  CHECK(game.turnsRemaining() == 4);
+  const auto deck = game.drawPile();
+  CHECK(game.adminEndTurnWithKitten(1).ok);
+  CHECK(game.activePlayer() == 3);
+  CHECK(game.turnsRemaining() == 3);
+  CHECK(game.kittenPlayer() == 1);
+  CHECK(game.chooseDefusePosition(1, 0).ok);
+  CHECK(game.activePlayer() == 3);
+  CHECK(game.turnsRemaining() == 3);
+  CHECK(game.adminEndTurnWithKitten(3).ok);
+  CHECK(game.turnsRemaining() == 2);
+  CHECK(game.chooseDefusePosition(3, 0).ok);
+  CHECK(game.activePlayer() == 3);
+  CHECK(game.turnsRemaining() == 2);
+  attack(game, 0);
+  CHECK(game.turnsRemaining() == 4);  // Defuse did not consume another debt turn.
+  exhaustDefuses(game, 1);
+  CHECK(game.adminEndTurnWithKitten(1).ok);
+  CHECK(!game.players()[1].alive);
+  CHECK(game.activePlayer() == 0);
+  CHECK(game.turnsRemaining() == 3);
+  attack(game, 2);
+  CHECK(game.turnsRemaining() == 5);  // Non-current explosion kept attack status.
+  exhaustDefuses(game, 2);
+  CHECK(game.adminEndTurnWithKitten(2).ok);
+  CHECK(!game.players()[2].alive);
+  CHECK(game.activePlayer() == 3);
+  CHECK(game.turnsRemaining() == 1);
+  checkCards(game.drawPile(), deck);
+
+  Game last({"A", "B", "C"}, 8);
+  CHECK(last.start(false, true).ok);
+  attack(last, 2);
+  CHECK(last.adminEndTurnWithKitten(1).ok);
+  CHECK(last.chooseDefusePosition(1, 0).ok);
+  CHECK(last.activePlayer() == 2);
+  CHECK(last.turnsRemaining() == 1);
+  CHECK(last.adminEndTurnWithKitten(0).ok);
+  CHECK(last.activePlayer() == 0);
+  CHECK(last.turnsRemaining() == 1);
+  CHECK(last.chooseDefusePosition(0, 0).ok);
+  CHECK(last.activePlayer() == 0);
+  CHECK(last.turnsRemaining() == 1);
+  attack(last, 1);
+  CHECK(last.turnsRemaining() == 2);  // Completed debt cleared attack status.
+}
+
+void testAdminBombForfeit() {
+  for (int target : {0, 1, 2}) {
+    Game game({"A", "B", "C", "D"}, 65);
+    CHECK(game.start().ok);
+    const auto deck = game.drawPile();
+    CHECK(game.adminEndTurnWithKitten(target).ok);
+    const auto kitten = *game.players()[target].exploded;
+    const auto hand = game.hand(target);
+    CHECK(game.forfeit(target).ok);
+    CHECK(!game.players()[target].alive);
+    CHECK(game.phase() == Phase::Turn);
+    CHECK(game.activePlayer() == (target == 1 ? 2 : 1));
+    CHECK(game.turnsRemaining() == 1);
+    CHECK(game.kittenPlayer() == -1);
+    CHECK(game.discardPile().back().id == kitten.id);
+    checkCards(game.hand(target), hand);
+    checkCards(game.drawPile(), deck);
+    uniqueCardIds(game);
+  }
+  Game game({"A", "B", "C", "D"}, 19);
+  CHECK(game.start().ok);
+  CHECK(game.adminEndTurnWithKitten(3).ok);
+  const auto deck = game.drawPile();
+  const int kittenId = game.players()[3].exploded->id;
+  CHECK(game.forfeit(1).ok);  // The active player is not the prompted player.
+  CHECK(game.phase() == Phase::Kitten);
+  CHECK(game.activePlayer() == 2);
+  CHECK(game.kittenPlayer() == 3);
+  CHECK(game.players()[3].exploded->id == kittenId);
+  rejectUnchanged(game, [&] { return game.draw(2); }, "NOT_IN_TURN");
+  CHECK(game.forfeit(0).ok);
+  CHECK(game.phase() == Phase::Kitten);
+  CHECK(game.activePlayer() == 2);
+  CHECK(game.kittenPlayer() == 3);
+  CHECK(game.chooseDefusePosition(3, 0).ok);
+  CHECK(game.phase() == Phase::Turn);
+  CHECK(game.activePlayer() == 2);
+  CHECK(game.turnsRemaining() == 1);
+  checkCards(game.drawPile(), deck);
+
+  Game debt({"A", "B", "C", "D"}, 22);
+  CHECK(debt.start(false, true).ok);
+  attack(debt, 2);
+  CHECK(debt.adminEndTurnWithKitten(0).ok);
+  CHECK(debt.turnsRemaining() == 1);
+  CHECK(debt.forfeit(0).ok);
+  CHECK(debt.activePlayer() == 2);
+  CHECK(debt.turnsRemaining() == 1);
+  attack(debt, 3);
+  CHECK(debt.turnsRemaining() == 3);
+
+  for (bool promptedForfeits : {false, true}) {
+    Game final({"A", "B"}, 62);
+    CHECK(final.start().ok);
+    const auto finalDeck = final.drawPile();
+    CHECK(final.adminEndTurnWithKitten(0).ok);
+    auto ids = uniqueCardIds(final);
+    CHECK(final.forfeit(promptedForfeits ? 0 : 1).ok);
+    CHECK(final.phase() == Phase::GameOver);
+    CHECK(final.winner() == (promptedForfeits ? 1 : 0));
+    CHECK(final.kittenPlayer() == -1);
+    CHECK(uniqueCardIds(final) == ids);
+    CHECK(final.players()[0].exploded.has_value() == promptedForfeits);
+    checkCards(final.drawPile(), finalDeck);
+  }
+}
+
+void testNormalKittenAttackDebt() {
+  auto game = findGame([](const Game& candidate) {
+    return candidate.drawPile().back().type == CardType::ExplodingKitten;
+  }, 3, false, true);
+  attack(*game, 2);
+  const auto deck = game->drawPile();
+  const int defuses = static_cast<int>(findCards(*game, 2, CardType::Defuse).size());
+  for (int turn = 0; turn < 2; ++turn) {
+    CHECK(game->activePlayer() == 2);
+    CHECK(game->turnsRemaining() == 2 - turn);
+    if (findCard(*game, 2, CardType::Defuse) < 0) addCard(*game, 2, CardType::Defuse);
+    CHECK(game->draw(2).ok);
+    CHECK(game->phase() == Phase::Kitten);
+    CHECK(game->kittenPlayer() == 2);
+    CHECK(game->activePlayer() == 2);
+    CHECK(game->turnsRemaining() == 2 - turn);
+    CHECK(game->chooseDefusePosition(2, 0).ok);
+    CHECK(game->kittenPlayer() == -1);
+    checkCards(game->drawPile(), deck);
+  }
+  CHECK(game->activePlayer() == 0);
+  CHECK(game->turnsRemaining() == 1);
+  CHECK(static_cast<int>(findCards(*game, 2, CardType::Defuse).size()) == std::max(0, defuses - 2));
+  uniqueCardIds(*game);
+}
+
 int main() {
   testSetup();
   testFastSetup();
@@ -760,5 +1372,16 @@ int main() {
   testBombCountAutomaticExplosion();
   testForfeitWithDefuse();
   testInvalidActions();
+  testFreeAttackConfigurationAndValidation();
+  testFreeAttackNopeStackingAndForfeit();
+  testDefaultAttackDebtAndFreeTargetForfeit();
+  testRequestedCardVisibility();
+  testAdminCardsAndValidation();
+  testAdminCardsDuringActivePhases();
+  testAdminBombDefuseAndTurnAccounting();
+  testAdminBombAutomaticExplosion();
+  testAdminBombAttackDebt();
+  testAdminBombForfeit();
+  testNormalKittenAttackDebt();
   std::cout << "game tests passed\n";
 }

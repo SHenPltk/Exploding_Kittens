@@ -10,7 +10,9 @@ The C++ host listens on TCP port 8765 by default. Messages are UTF-8, one line e
 | `START` | The host starts with 2–5 connected players. |
 | `RESTART` | The online host starts a fresh game after GAME_OVER with the remaining 2–5 online players. |
 | `SET_FAST 0\|1` | Host-only next-game option, accepted in the lobby or after GAME_OVER; enabling is limited to at most 3 connected players (START still requires at least 2). |
-| `PLAY card [target]` | Play one hand card. Favor needs a target. |
+| `SET_FREE_ATTACK 0\|1` | Host-only next-game option in lobby/GAME_OVER. |
+| `KICK player_id` | Host removes a different online player; active players forfeit. |
+| `PLAY card [target]` | Play one hand card. Favor and Free Attack require another living target. |
 | `COMBO a b target` | Two of a kind. |
 | `COMBO a b c target TYPE` | Three of a kind, requesting `TYPE`. |
 | `DRAW` | End the acting player's action phase by drawing. |
@@ -27,8 +29,11 @@ The C++ host listens on TCP port 8765 by default. Messages are UTF-8, one line e
 - `STATE sequence phase active_player turns_remaining draw_count discard_count winner pending_type pending_actor pending_target nope_count response_leader`
 - `ROUND round_number` (monotonically increases for every fresh game; card ids may be reused across rounds)
 - `SESSION host_player_id connected_count` (current online host and number eligible for restart)
-- `OPTIONS fast_enabled` (`0`/`1`; next-game setting, also broadcast immediately after each lobby ROSTER)
-- `MODE fast_enabled` (`0`/`1`; immutable mode used to set up the current game)
+- `OPTIONS fast_enabled free_attack_enabled` (two `0`/`1` next-game flags, broadcast in lobby and snapshots)
+- `MODE fast_enabled free_attack_enabled` (immutable current-game flags)
+- `ONLINE player_id ...` (connected game participants eligible for host removal)
+- `REQUESTED TYPE` (RESPONSE COMBO3 only; original requested title remains public throughout Nope chains)
+- `PROMPT player_id` (KITTEN only; actual prompted player, which can differ from active_player after admin injection)
 - `DECK bomb_count` (public; count only in the current draw pile)
 - `PENDING original_actor TYPE ...` (public; sent only in RESPONSE, including all original combo card types)
 - `PLAYER player_id name alive hand_count exploded_card_or_dash`
@@ -51,4 +56,43 @@ Card ids are protocol identifiers; the UI shows card names only. Language and ha
 
 A single Cat card is rejected with CAT_CARDS_REQUIRE_COMBO without modifying the hand, discard pile, or phase. Two and three matching Cat cards remain valid combos.
 
-The complete draw-pile order, other players' hands, Defuse insertion position, and See the Future result are never broadcast outside the owning player. The server validates every command again even if the GUI disabled the corresponding button.
+Ordinary player connections never receive the complete draw-pile order, other players' hands, Defuse insertion position, or another player's See the Future result. The server validates every command again even if the GUI disabled the corresponding button. A separately authenticated administrator can explicitly inspect all hands and the deck as described below.
+
+## Free Attack and removal
+
+SET_FREE_ATTACK uses the same host/lobby/GAME_OVER permission rules as SET_FAST, without the fast-mode player limit. Default Attack retains next-alive behavior and rejects explicit targets. With Free Attack on, Attack requires another living target; debt transfer/Nope parity remain unchanged. The turn after all victim debt completes is the victim's clockwise successor. If a pending target forfeits, the original action is cancelled without changing the actor's turn.
+
+KICK requires the actual nominated online host (not necessarily player 0); self/offline targets are rejected. The removed connection receives EVENT ERROR KICKED and closes. Lobby players are reindexed with WELCOME; in-game removal uses the engine's forfeit path and cancels or resolves pending prompts safely. Host nomination survives reindex and rematches; if the host leaves, the next online player clockwise becomes host.
+
+PROMPT rather than active_player identifies who must Defuse. Clients auto-open required Defuse/Favor dialogs once per outstanding prompt, close stale dialogs when state changes, and do not require a Resolve button. Clicking Nope picks one private Nope id automatically.
+
+## Authenticated administrator protocol
+
+First line on a separate TCP connection: `ADMIN password` (tab-separated). This connection never joins the player roster. It receives `ADMIN_OK AUTHENTICATED` or `ADMIN_ERROR AUTH_FAILED`; incorrect auth closes the connection. All commands and responses remain tab-separated lines.
+
+| Command | Behavior |
+|---|---|
+| `ADMIN_STATE` | Private complete snapshot (below). |
+| `ADMIN_HOST player_id` | Nominate a connected player as host; broadcast normal SESSION update. |
+| `ADMIN_ADD player_id TYPE` | Create a new unique hand card for a living player in an active game. Kitten requires TURN and triggers immediately. |
+| `ADMIN_BOMB player_id` | TURN only: finish exactly one current turn, then create and trigger a Kitten for the selected living player. |
+| `ADMIN_PASSWORD new_password` | Persist a new 8–128-byte UTF-8 password with no tab/CR/LF/NUL. |
+
+Mutation ACKs are ADMIN_OK HOST_CHANGED / CARD_ADDED / KITTEN_INJECTED / PASSWORD_CHANGED. Failures use ADMIN_ERROR code; no private data accompanies failed auth. ADMIN_STATE replies:
+
+```text
+ADMIN_BEGIN phase host_player_id round_number
+ADMIN_PLAYER id name alive online
+ADMIN_HAND id card_id:TYPE ...
+... repeated PLAYER/HAND for all players ...
+ADMIN_DECK card_id:TYPE ...
+ADMIN_END
+```
+
+ADMIN_DECK is **top first**; HAND records include eliminated hands and empty hands. Read snapshots atomically. Administrator card creation never removes/reorders draw-pile cards; a synthetic Kitten is discarded after Defuse (together with Defuse), not inserted into the original deck. An injected Kitten prompt consumes no additional turn; ordinary drawn Kittens still end their own drawn turn normally. Forced turn completion is blocked during RESPONSE/FAVOR/KITTEN.
+
+Credentials default to Admin123 only when no verifier file exists. Server writes a 16-byte random salt and 32-byte PBKDF2-HMAC-SHA256 verifier with 600,000 iterations using atomic replacement. Malformed existing credentials fail closed. Password changes invalidate other administrator sessions with AUTH_EXPIRED; the changer remains authenticated. Bounded authentication attempts, handshake deadlines and session limits apply. The management protocol has no TLS; use it on a trusted LAN.
+
+## HTTP client distribution
+
+`ek_server [game_port=8765] [http_port=game_port+1; 0 disables] [credentials_path]` binds the game and enabled HTTP service to all IPv4 interfaces. GET/HEAD `/` serves a download landing page; GET/HEAD `/client.zip` serves a valid ZIP containing only `main.py`, `i18n.py`, `presentation.py`, `start_client.bat` and client README. Python 3.10+ with Tkinter is required. Other paths, including traversal, administrator code and credentials, return 404. No directory listing or general file endpoint exists. Download files are read from an explicit three-file client allowlist, with generated launcher/instructions; neither the admin program nor verifier is included.

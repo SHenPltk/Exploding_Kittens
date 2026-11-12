@@ -1,4 +1,6 @@
 #include "exploding_kittens/game.hpp"
+#include "admin_auth.hpp"
+#include "client_download.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -13,10 +15,15 @@
 #include <vector>
 #include <optional>
 #include <random>
+#include <chrono>
+#include <filesystem>
+#include <map>
 
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <windows.h>
+#include <shellapi.h>
 using Socket = SOCKET;
 constexpr Socket kInvalidSocket = INVALID_SOCKET;
 #else
@@ -36,6 +43,8 @@ struct Client {
   std::string name;
   std::mutex writeMutex;
   std::atomic<bool> connected{true};
+  bool isHost = false;
+  std::uint64_t authGeneration = 0;
 };
 
 std::mutex stateMutex;
@@ -44,6 +53,14 @@ std::unique_ptr<ek::Game> game;
 std::uint64_t sequence = 0;
 std::uint64_t roundNumber = 0;
 bool nextFastMode = false;
+bool nextFreeAttackMode = false;
+std::vector<std::shared_ptr<Client>> administrators;
+std::unique_ptr<ek::AdminAuth> adminAuth;
+std::atomic<int> pendingHandshakes{0};
+std::mutex authRateMutex;
+struct AuthRate { int failures = 0; std::chrono::steady_clock::time_point reset; };
+std::map<std::uint32_t, AuthRate> authFailures;
+AuthRate globalAuthFailures;
 
 void closeSocket(Socket socket) {
 #ifdef _WIN32
@@ -63,7 +80,7 @@ bool sendLine(const std::shared_ptr<Client>& client, const std::string& line) {
                             static_cast<int>(payload.size() - sent), 0);
 #else
     const ssize_t result = send(client->socket, payload.data() + sent,
-                                payload.size() - sent, 0);
+                                payload.size() - sent, MSG_NOSIGNAL);
 #endif
     if (result <= 0) return false;
     sent += static_cast<std::size_t>(result);
@@ -71,18 +88,23 @@ bool sendLine(const std::shared_ptr<Client>& client, const std::string& line) {
   return true;
 }
 
-bool receiveLine(Socket socket, std::string& output) {
+bool receiveLine(Socket socket, std::string& output, int deadlineSeconds = 0) {
   output.clear();
   char character = 0;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(deadlineSeconds);
   while (output.size() < 8192) {
+    if (deadlineSeconds && std::chrono::steady_clock::now() >= deadline) return false;
 #ifdef _WIN32
     const int result = recv(socket, &character, 1, 0);
 #else
     const ssize_t result = recv(socket, &character, 1, 0);
 #endif
     if (result <= 0) return false;
-    if (character == '\n') return true;
-    if (character != '\r') output.push_back(character);
+    if (character == '\n') {
+      if (!output.empty() && output.back() == '\r') output.pop_back();
+      return true;
+    }
+    output.push_back(character);
   }
   return false;
 }
@@ -92,12 +114,15 @@ std::vector<std::string> split(const std::string& line) {
   std::stringstream stream(line);
   std::string item;
   while (std::getline(stream, item, '\t')) result.push_back(item);
+  if (!line.empty() && line.back() == '\t') result.emplace_back();
   return result;
 }
 
 std::string sanitize(std::string value) {
   std::replace(value.begin(), value.end(), '\t', ' ');
   std::replace(value.begin(), value.end(), '\n', ' ');
+  std::replace(value.begin(), value.end(), '\r', ' ');
+  std::replace(value.begin(), value.end(), '\0', ' ');
   return value;
 }
 
@@ -110,9 +135,52 @@ std::string normalizeName(std::string name) {
 
 int hostPlayerLocked() {
   for (const auto& client : clients) {
-    if (client->connected) return client->player;
+    if (client->connected && client->isHost) return client->player;
   }
   return -1;
+}
+
+void ensureHostLocked() {
+  if (hostPlayerLocked() >= 0) return;
+  for (const auto& client : clients) client->isHost = false;
+  for (const auto& client : clients) {
+    if (client->connected) { client->isHost = true; break; }
+  }
+}
+
+std::shared_ptr<Client> onlinePlayerLocked(int player) {
+  for (const auto& client : clients) {
+    if (client->connected && client->player == player) return client;
+  }
+  return nullptr;
+}
+
+int parseInteger(const std::string& text) {
+  std::size_t consumed = 0;
+  const int result = std::stoi(text, &consumed);
+  if (consumed != text.size()) throw std::invalid_argument("integer");
+  return result;
+}
+
+void shutdownSocket(Socket socket) {
+#ifdef _WIN32
+  shutdown(socket, SD_BOTH);
+#else
+  shutdown(socket, SHUT_RDWR);
+#endif
+}
+
+void setSocketTimeouts(Socket socket, int receiveSeconds, int sendSeconds = 3) {
+#ifdef _WIN32
+  const DWORD receive = static_cast<DWORD>(receiveSeconds * 1000);
+  const DWORD sendTimeout = static_cast<DWORD>(sendSeconds * 1000);
+  setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&receive), sizeof(receive));
+  setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&sendTimeout), sizeof(sendTimeout));
+#else
+  const timeval receive{receiveSeconds, 0}, sendTimeout{sendSeconds, 0};
+  setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, &receive, sizeof(receive));
+  setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, &sendTimeout, sizeof(sendTimeout));
+#endif
 }
 
 int connectedCountLocked() {
@@ -121,7 +189,8 @@ int connectedCountLocked() {
 }
 
 void sendOptionsLocked(const std::shared_ptr<Client>& client) {
-  sendLine(client, std::string("OPTIONS\t") + (nextFastMode ? "1" : "0"));
+  sendLine(client, std::string("OPTIONS\t") + (nextFastMode ? "1" : "0") + "\t" +
+                       (nextFreeAttackMode ? "1" : "0"));
 }
 
 void sendRosterLocked() {
@@ -134,6 +203,8 @@ void sendRosterLocked() {
   for (const auto& client : clients) {
     if (client->connected) {
       sendLine(client, roster.str());
+      sendLine(client, "SESSION\t" + std::to_string(hostPlayerLocked()) + "\t" +
+                           std::to_string(connectedCountLocked()));
       sendOptionsLocked(client);
     }
   }
@@ -162,7 +233,12 @@ void sendSnapshotLocked() {
     sendLine(client, "ROUND\t" + std::to_string(roundNumber));
     sendLine(client, "SESSION\t" + std::to_string(hostPlayerLocked()) + "\t" +
                          std::to_string(connectedCountLocked()));
-    sendLine(client, std::string("MODE\t") + (game->fastMode() ? "1" : "0"));
+    std::ostringstream online;
+    online << "ONLINE";
+    for (const auto& item : clients) if (item->connected) online << '\t' << item->player;
+    sendLine(client, online.str());
+    sendLine(client, std::string("MODE\t") + (game->fastMode() ? "1" : "0") + "\t" +
+                         (game->freeAttackMode() ? "1" : "0"));
     sendOptionsLocked(client);
     sendLine(client, "DECK\t" + std::to_string(game->bombCount()));
     if (game->phase() == ek::Phase::Response) {
@@ -172,6 +248,12 @@ void sendSnapshotLocked() {
         pending << '\t' << ek::cardTypeName(card.type);
       }
       sendLine(client, pending.str());
+      if (game->pendingType() == "COMBO3" && game->pendingRequestedCard()) {
+        sendLine(client, "REQUESTED\t" + ek::cardTypeName(*game->pendingRequestedCard()));
+      }
+    }
+    if (game->phase() == ek::Phase::Kitten) {
+      sendLine(client, "PROMPT\t" + std::to_string(game->kittenPlayer()));
     }
     for (const auto& player : game->players()) {
       sendLine(client, "PLAYER\t" + std::to_string(player.id) + "\t" +
@@ -209,6 +291,35 @@ void sendResultLocked(const ek::ActionResult& result) {
   }
 }
 
+// Caller owns stateMutex. The connection owner alone closes its socket.
+void removeClientLocked(const std::shared_ptr<Client>& client, bool kicked) {
+  if (!client->connected.exchange(false)) return;
+  if (kicked) sendLine(client, "EVENT\tERROR\tKICKED");
+  if (client->isHost) {
+    const auto position = std::find(clients.begin(), clients.end(), client);
+    if (position != clients.end()) {
+      const auto index = static_cast<std::size_t>(position - clients.begin());
+      for (std::size_t offset = 1; offset < clients.size(); ++offset) {
+        const auto& successor = clients[(index + offset) % clients.size()];
+        if (successor->connected) { successor->isHost = true; break; }
+      }
+    }
+  }
+  client->isHost = false;
+  if (game) {
+    if (game->phase() != ek::Phase::GameOver) sendResultLocked(game->forfeit(client->player));
+  } else {
+    clients.erase(std::remove(clients.begin(), clients.end(), client), clients.end());
+    for (std::size_t i = 0; i < clients.size(); ++i) {
+      clients[i]->player = static_cast<int>(i);
+      if (clients[i]->connected) sendLine(clients[i], "WELCOME\t" + std::to_string(i));
+    }
+  }
+  ensureHostLocked();
+  shutdownSocket(client->socket);
+  sendSnapshotLocked();
+}
+
 void processCommand(const std::shared_ptr<Client>& client, const std::vector<std::string>& parts) {
   std::lock_guard<std::mutex> lock(stateMutex);
   if (parts.empty() || !client->connected) return;
@@ -217,17 +328,35 @@ void processCommand(const std::shared_ptr<Client>& client, const std::vector<std
     sendLine(client, "PONG");
     return;
   }
-  if (parts[0] == "SET_FAST") {
+  if (parts[0] == "KICK") {
+    if (!client->isHost) {
+      sendLine(client, "EVENT\tERROR\tONLY_HOST_CAN_KICK");
+    } else {
+      try {
+        if (parts.size() != 2) throw std::invalid_argument("kick");
+        const int player = parseInteger(parts[1]);
+        const auto target = onlinePlayerLocked(player);
+        if (player == client->player) sendLine(client, "EVENT\tERROR\tCANNOT_KICK_SELF");
+        else if (!target) sendLine(client, "EVENT\tERROR\tPLAYER_OFFLINE");
+        else removeClientLocked(target, true);
+      } catch (const std::exception&) {
+        sendLine(client, "EVENT\tERROR\tINVALID_COMMAND_ARGUMENT");
+      }
+    }
+    return;
+  }
+  if (parts[0] == "SET_FAST" || parts[0] == "SET_FREE_ATTACK") {
     if (client->player != hostPlayerLocked()) {
       sendLine(client, "EVENT\tERROR\tONLY_HOST_CAN_SET_OPTIONS");
     } else if (game && game->phase() != ek::Phase::GameOver) {
       sendLine(client, "EVENT\tERROR\tOPTIONS_LOCKED_DURING_GAME");
     } else if (parts.size() != 2 || (parts[1] != "0" && parts[1] != "1")) {
       sendLine(client, "EVENT\tERROR\tINVALID_COMMAND_ARGUMENT");
-    } else if (parts[1] == "1" && connectedCountLocked() > 3) {
+    } else if (parts[0] == "SET_FAST" && parts[1] == "1" && connectedCountLocked() > 3) {
       sendLine(client, "EVENT\tERROR\tFAST_MODE_REQUIRES_2_OR_3_PLAYERS");
     } else {
-      nextFastMode = parts[1] == "1";
+      if (parts[0] == "SET_FAST") nextFastMode = parts[1] == "1";
+      else nextFreeAttackMode = parts[1] == "1";
       sendSnapshotLocked();
     }
     return;
@@ -255,7 +384,7 @@ void processCommand(const std::shared_ptr<Client>& client, const std::vector<std
       }
       std::random_device entropy;
       auto nextGame = std::make_unique<ek::Game>(std::move(names), entropy());
-      const auto result = nextGame->start(nextFastMode);
+      const auto result = nextGame->start(nextFastMode, nextFreeAttackMode);
       if (!result.ok) {
         sendLine(client, "EVENT\tERROR\t" + result.message);
         return;
@@ -293,7 +422,7 @@ void processCommand(const std::shared_ptr<Client>& client, const std::vector<std
         targetIndex = 4;
         requested = ek::cardTypeFromName(parts[5]);
         if (!requested) {
-          result = ek::ActionResult{false, "INVALID_REQUESTED_CARD"};
+          result = ek::ActionResult{false, "INVALID_REQUESTED_CARD", -1, {}};
           sendResultLocked(result);
           sendSnapshotLocked();
           return;
@@ -315,10 +444,10 @@ void processCommand(const std::shared_ptr<Client>& client, const std::vector<std
     } else if (parts[0] == "EXPLODE") {
       result = game->declineDefuse(client->player);
     } else {
-      result = ek::ActionResult{false, "UNKNOWN_COMMAND"};
+      result = ek::ActionResult{false, "UNKNOWN_COMMAND", -1, {}};
     }
   } catch (const std::exception&) {
-    result = ek::ActionResult{false, "INVALID_COMMAND_ARGUMENT"};
+    result = ek::ActionResult{false, "INVALID_COMMAND_ARGUMENT", -1, {}};
   }
   sendResultLocked(result);
   sendSnapshotLocked();
@@ -329,24 +458,208 @@ void clientThread(const std::shared_ptr<Client>& client) {
   while (client->connected && receiveLine(client->socket, line)) {
     processCommand(client, split(line));
   }
-  std::lock_guard<std::mutex> lock(stateMutex);
-  client->connected = false;
-  if (game && game->phase() != ek::Phase::GameOver) {
-    sendResultLocked(game->forfeit(client->player));
-    sendSnapshotLocked();
-  } else if (game) {
-    sendSnapshotLocked();
-  } else {
-    clients.erase(std::remove_if(clients.begin(), clients.end(),
-                                 [client](const auto& item) { return item == client; }),
-                  clients.end());
-    for (std::size_t i = 0; i < clients.size(); ++i) {
-      clients[i]->player = static_cast<int>(i);
-      sendLine(clients[i], "WELCOME\t" + std::to_string(clients[i]->player));
-    }
-    sendRosterLocked();
+  {
+    std::lock_guard<std::mutex> lock(stateMutex);
+    removeClientLocked(client, false);
   }
   closeSocket(client->socket);
+}
+
+bool allowAdminAttempt(std::uint32_t address) {
+  std::lock_guard<std::mutex> lock(authRateMutex);
+  const auto now = std::chrono::steady_clock::now();
+  for (auto it = authFailures.begin(); it != authFailures.end();) {
+    if (now >= it->second.reset) it = authFailures.erase(it); else ++it;
+  }
+  if (now >= globalAuthFailures.reset) globalAuthFailures = {0, now + std::chrono::seconds(60)};
+  if (authFailures.size() >= 1024 && !authFailures.count(address)) return false;
+  auto& rate = authFailures[address];
+  if (now >= rate.reset) rate = {0, now + std::chrono::seconds(60)};
+  if (rate.failures >= 5 || globalAuthFailures.failures >= 30) return false;
+  ++rate.failures;
+  ++globalAuthFailures.failures;
+  return true;
+}
+
+void authenticatedSuccessfully(std::uint32_t address) {
+  std::lock_guard<std::mutex> lock(authRateMutex);
+  authFailures.erase(address);
+  if (globalAuthFailures.failures > 0) --globalAuthFailures.failures;
+}
+
+void sendAdminStateLocked(const std::shared_ptr<Client>& admin) {
+  sendLine(admin, "ADMIN_BEGIN\t" + (game ? ek::phaseName(game->phase()) : "LOBBY") +
+                      "\t" + std::to_string(hostPlayerLocked()) + "\t" + std::to_string(roundNumber));
+  if (game) {
+    for (const auto& player : game->players()) {
+      sendLine(admin, "ADMIN_PLAYER\t" + std::to_string(player.id) + "\t" + sanitize(player.name) +
+                          "\t" + (player.alive ? "1" : "0") + "\t" +
+                          (onlinePlayerLocked(player.id) ? "1" : "0"));
+      std::ostringstream hand;
+      hand << "ADMIN_HAND\t" << player.id;
+      for (const auto& card : player.hand) hand << '\t' << cardToken(card);
+      sendLine(admin, hand.str());
+    }
+  } else {
+    for (const auto& player : clients) {
+      if (!player->connected) continue;
+      sendLine(admin, "ADMIN_PLAYER\t" + std::to_string(player->player) + "\t" +
+                          sanitize(player->name) + "\t1\t1");
+      sendLine(admin, "ADMIN_HAND\t" + std::to_string(player->player));
+    }
+  }
+  std::ostringstream deck;
+  deck << "ADMIN_DECK";
+  if (game) {
+    for (auto card = game->drawPile().rbegin(); card != game->drawPile().rend(); ++card)
+      deck << '\t' << cardToken(*card);
+  }
+  sendLine(admin, deck.str());
+  sendLine(admin, "ADMIN_END");
+}
+
+void processAdminCommand(const std::shared_ptr<Client>& admin, const std::vector<std::string>& parts) {
+  std::lock_guard<std::mutex> lock(stateMutex);
+  if (!admin->connected) return;
+  if (admin->authGeneration != adminAuth->generation()) {
+    sendLine(admin, "ADMIN_ERROR\tAUTH_EXPIRED");
+    admin->connected = false;
+    shutdownSocket(admin->socket);
+    return;
+  }
+  auto error = [&admin](const std::string& code) { sendLine(admin, "ADMIN_ERROR\t" + sanitize(code)); };
+  if (parts.empty()) { error("UNKNOWN_COMMAND"); return; }
+  try {
+    if (parts[0] == "ADMIN_STATE" && parts.size() == 1) {
+      sendAdminStateLocked(admin);
+      return;
+    }
+    if (parts[0] == "ADMIN_PASSWORD" && parts.size() == 2) {
+      std::string message;
+      if (!adminAuth->changePassword(parts[1], admin->authGeneration, message)) { error(message); return; }
+      admin->authGeneration = adminAuth->generation();
+      sendLine(admin, "ADMIN_OK\tPASSWORD_CHANGED");
+      for (const auto& other : administrators) {
+        if (other == admin || !other->connected) continue;
+        sendLine(other, "ADMIN_ERROR\tAUTH_EXPIRED");
+        other->connected = false;
+        shutdownSocket(other->socket);
+      }
+      return;
+    }
+    if (parts[0] == "ADMIN_HOST" && parts.size() == 2) {
+      const int player = parseInteger(parts[1]);
+      if (player < 0 || player >= static_cast<int>(game ? game->players().size() : clients.size())) {
+        error("INVALID_PLAYER"); return;
+      }
+      const auto target = onlinePlayerLocked(player);
+      if (!target) { error("PLAYER_OFFLINE"); return; }
+      for (const auto& item : clients) item->isHost = item == target;
+      sendLine(admin, "ADMIN_OK\tHOST_CHANGED");
+      sendSnapshotLocked();
+      return;
+    }
+    if ((parts[0] == "ADMIN_ADD" && parts.size() == 3) ||
+        (parts[0] == "ADMIN_BOMB" && parts.size() == 2)) {
+      if (!game) { error("GAME_NOT_STARTED"); return; }
+      const int player = parseInteger(parts[1]);
+      ek::ActionResult result;
+      if (parts[0] == "ADMIN_ADD") {
+        const auto type = ek::cardTypeFromName(parts[2]);
+        if (!type) { error("INVALID_CARD_TYPE"); return; }
+        result = game->adminAddCard(player, *type);
+      } else {
+        result = game->adminEndTurnWithKitten(player);
+      }
+      if (!result.ok) { error(result.message); return; }
+      sendLine(admin, parts[0] == "ADMIN_ADD" ? "ADMIN_OK\tCARD_ADDED" : "ADMIN_OK\tKITTEN_INJECTED");
+      sendResultLocked(result);
+      sendSnapshotLocked();
+      return;
+    }
+    if (parts[0] == "ADMIN_STATE" || parts[0] == "ADMIN_HOST" || parts[0] == "ADMIN_ADD" ||
+        parts[0] == "ADMIN_BOMB" || parts[0] == "ADMIN_PASSWORD") error("INVALID_COMMAND_ARGUMENT");
+    else error("UNKNOWN_COMMAND");
+  } catch (const std::exception&) {
+    error("INVALID_COMMAND_ARGUMENT");
+  }
+}
+
+void administratorThread(const std::shared_ptr<Client>& admin) {
+  std::string line;
+  while (admin->connected && receiveLine(admin->socket, line, 300)) {
+    processAdminCommand(admin, split(line));
+  }
+  {
+    std::lock_guard<std::mutex> lock(stateMutex);
+    admin->connected = false;
+    administrators.erase(std::remove(administrators.begin(), administrators.end(), admin), administrators.end());
+  }
+  closeSocket(admin->socket);
+}
+
+void connectionThread(const std::shared_ptr<Client>& client, std::uint32_t address) {
+  struct HandshakeSlot {
+    bool held = true;
+    void release() { if (held) { --pendingHandshakes; held = false; } }
+    ~HandshakeSlot() { release(); }
+  } slot;
+  setSocketTimeouts(client->socket, 5);
+  std::string hello;
+  if (!receiveLine(client->socket, hello, 5)) { closeSocket(client->socket); return; }
+  const auto parts = split(hello);
+  if (!parts.empty() && parts[0] == "ADMIN") {
+    const bool allowed = allowAdminAttempt(address);
+    if (!allowed || parts.size() != 2 ||
+        !adminAuth->verify(parts.size() == 2 ? parts[1] : "", client->authGeneration)) {
+      sendLine(client, "ADMIN_ERROR\tAUTH_FAILED");
+      closeSocket(client->socket);
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> lock(stateMutex);
+      if (client->authGeneration != adminAuth->generation()) {
+        sendLine(client, "ADMIN_ERROR\tAUTH_EXPIRED"); closeSocket(client->socket); return;
+      }
+      if (administrators.size() >= 8) {
+        sendLine(client, "ADMIN_ERROR\tADMIN_SESSION_LIMIT"); closeSocket(client->socket); return;
+      }
+      administrators.push_back(client);
+      setSocketTimeouts(client->socket, 300);
+      sendLine(client, "ADMIN_OK\tAUTHENTICATED");
+    }
+    authenticatedSuccessfully(address);
+    slot.release();
+    administratorThread(client);
+    return;
+  }
+  if (parts.size() != 2 || parts[0] != "JOIN") {
+    sendLine(client, "EVENT\tERROR\tFIRST_COMMAND_MUST_BE_JOIN"); closeSocket(client->socket); return;
+  }
+  const std::string name = normalizeName(parts[1]);
+  if (name.empty() || name.size() > 128 || name.find_first_of("\r\n\0", 0, 3) != std::string::npos) {
+    sendLine(client, "EVENT\tERROR\tINVALID_NAME"); closeSocket(client->socket); return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(stateMutex);
+    if (game || clients.size() >= 5) {
+      sendLine(client, "EVENT\tERROR\tLOBBY_CLOSED"); closeSocket(client->socket); return;
+    }
+    const bool duplicate = std::any_of(clients.begin(), clients.end(),
+        [&name](const auto& item) { return item->connected && item->name == name; });
+    if (duplicate) {
+      sendLine(client, "EVENT\tERROR\tNAME_ALREADY_TAKEN"); closeSocket(client->socket); return;
+    }
+    client->player = static_cast<int>(clients.size());
+    client->name = name;
+    clients.push_back(client);
+    ensureHostLocked();
+    setSocketTimeouts(client->socket, 0);
+    sendLine(client, "WELCOME\t" + std::to_string(client->player));
+    sendRosterLocked();
+  }
+  slot.release();
+  clientThread(client);
 }
 
 }  // namespace
@@ -359,7 +672,41 @@ int main(int argc, char** argv) {
     return 1;
   }
 #endif
-  const int port = argc > 1 ? std::atoi(argv[1]) : 8765;
+  int port = 8765, httpPort = 8766;
+  try {
+    if (argc > 4) throw std::invalid_argument("arguments");
+    if (argc > 1) port = parseInteger(argv[1]);
+    httpPort = argc > 2 ? parseInteger(argv[2]) : port + 1;
+    if (port < 1 || port > 65535 || httpPort < 0 || httpPort > 65535 || httpPort == port)
+      throw std::invalid_argument("port");
+  } catch (const std::exception&) {
+    std::cerr << "Usage: ek_server [game_port=8765] [http_port=game_port+1; 0 disables] [credentials_path]\n";
+    return 1;
+  }
+  std::filesystem::path executable, credentials;
+  std::string startupError;
+  try {
+    executable = ek::executableDirectory(argv[0]);
+    credentials = executable / "server_admin.auth";
+#ifdef _WIN32
+    // The narrow CRT argv uses the system code page and can corrupt Unicode paths.
+    int wideCount = 0;
+    wchar_t** wideArguments = CommandLineToArgvW(GetCommandLineW(), &wideCount);
+    if (!wideArguments) throw std::runtime_error("command line");
+    if (wideCount > 3) credentials = std::filesystem::path(wideArguments[3]);
+    LocalFree(wideArguments);
+#else
+    if (argc > 3) credentials = std::filesystem::path(argv[3]);
+#endif
+    adminAuth = std::make_unique<ek::AdminAuth>(credentials);
+    if (!adminAuth->initialize(startupError)) {
+      std::cerr << "Administrator authentication unavailable: " << startupError << "\n";
+      return 1;
+    }
+  } catch (const std::exception&) {
+    std::cerr << "Administrator authentication unavailable: ADMIN_AUTH_PATH_FAILED\n";
+    return 1;
+  }
   const Socket listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
   if (listener == kInvalidSocket) {
     std::cerr << "could not create socket\n";
@@ -382,6 +729,11 @@ int main(int argc, char** argv) {
     closeSocket(listener);
     return 1;
   }
+  if (!ek::startClientDownload(httpPort, executable, credentials, port, startupError)) {
+    std::cerr << "Client download service unavailable: " << startupError << "\n";
+    closeSocket(listener);
+    return 1;
+  }
   std::cout << "Exploding Kittens server listening on TCP " << port << "\n";
   while (true) {
     sockaddr_in remote{};
@@ -392,62 +744,14 @@ int main(int argc, char** argv) {
 #endif
     const Socket clientSocket = accept(listener, reinterpret_cast<sockaddr*>(&remote), &length);
     if (clientSocket == kInvalidSocket) continue;
+    if (pendingHandshakes.fetch_add(1) >= 32) {
+      --pendingHandshakes;
+      closeSocket(clientSocket);
+      continue;
+    }
     auto client = std::make_shared<Client>();
     client->socket = clientSocket;
-#ifdef _WIN32
-    const DWORD handshakeTimeoutMs = 5000;
-    setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO,
-               reinterpret_cast<const char*>(&handshakeTimeoutMs), sizeof(handshakeTimeoutMs));
-#else
-    timeval handshakeTimeout{5, 0};
-    setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, &handshakeTimeout, sizeof(handshakeTimeout));
-#endif
-    std::string hello;
-    if (!receiveLine(clientSocket, hello)) {
-      closeSocket(clientSocket);
-      continue;
-    }
-    const auto parts = split(hello);
-    if (parts.size() != 2 || parts[0] != "JOIN") {
-      sendLine(client, "EVENT\tERROR\tFIRST_COMMAND_MUST_BE_JOIN");
-      closeSocket(clientSocket);
-      continue;
-    }
-    const std::string name = normalizeName(parts[1]);
-    if (name.empty()) {
-      sendLine(client, "EVENT\tERROR\tINVALID_NAME");
-      closeSocket(clientSocket);
-      continue;
-    }
-    {
-      std::lock_guard<std::mutex> lock(stateMutex);
-      if (game || clients.size() >= 5) {
-        sendLine(client, "EVENT\tERROR\tLOBBY_CLOSED");
-        closeSocket(clientSocket);
-        continue;
-      }
-      const bool duplicate = std::any_of(clients.begin(), clients.end(),
-          [&name](const auto& item) { return item->connected && item->name == name; });
-      if (duplicate) {
-        sendLine(client, "EVENT\tERROR\tNAME_ALREADY_TAKEN");
-        closeSocket(clientSocket);
-        continue;
-      }
-      client->player = static_cast<int>(clients.size());
-      client->name = name;
-      clients.push_back(client);
-#ifdef _WIN32
-      const DWORD noTimeout = 0;
-      setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO,
-                 reinterpret_cast<const char*>(&noTimeout), sizeof(noTimeout));
-#else
-      timeval noTimeout{0, 0};
-      setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, &noTimeout, sizeof(noTimeout));
-#endif
-      sendLine(client, "WELCOME\t" + std::to_string(client->player));
-      sendRosterLocked();
-    }
-    std::thread(clientThread, client).detach();
+    std::thread(connectionThread, client, remote.sin_addr.s_addr).detach();
   }
 #ifdef _WIN32
   WSACleanup();

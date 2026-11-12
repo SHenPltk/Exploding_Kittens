@@ -3,6 +3,7 @@ import socket
 import subprocess
 import sys
 import time
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -90,7 +91,9 @@ class ServerIntegrationTests(unittest.TestCase):
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 0))
             port = probe.getsockname()[1]
-        process = subprocess.Popen([str(SERVER), str(port)], cwd=ROOT,
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        process = subprocess.Popen([str(SERVER), str(port), "0", str(Path(directory.name) / "admin.auth")], cwd=ROOT,
                                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
         def stop():
@@ -116,12 +119,12 @@ class ServerIntegrationTests(unittest.TestCase):
                 time.sleep(0.02)
         peers = [peer]
         self.addCleanup(peer.close)
+        peer.wait_for("WELCOME")
         for index in range(1, count):
             peer = Peer(port, "玩家" + str(index))
             self.addCleanup(peer.close)
-            peers.append(peer)
-        for peer in peers:
             peer.wait_for("WELCOME")
+            peers.append(peer)
         return port, peers
 
     def start_game(self, count):
@@ -247,7 +250,7 @@ class ServerIntegrationTests(unittest.TestCase):
                 self.assertEqual(peers[0].wait_for("EVENT"), ["ERROR", "INVALID_COMMAND_ARGUMENT"])
                 peers[0].send("SET_FAST", 1)
                 for peer in peers:
-                    while peer.wait_for("OPTIONS") != ["1"]:
+                    while peer.wait_for("OPTIONS")[0] != "1":
                         pass
                 peers[0].send("START")
                 states = [peer.snapshot() for peer in peers]
@@ -272,14 +275,14 @@ class ServerIntegrationTests(unittest.TestCase):
         port, peers = self.start_lobby(3)
         peers[0].send("SET_FAST", 1)
         for peer in peers:
-            while peer.wait_for("OPTIONS") != ["1"]:
+            while peer.wait_for("OPTIONS")[0] != "1":
                 pass
         fourth = Peer(port, "玩家四")
         self.addCleanup(fourth.close)
         fourth.wait_for("WELCOME")
         peers.append(fourth)
         for peer in peers:
-            self.assertEqual(peer.wait_for("OPTIONS"), ["0"])
+            self.assertEqual(peer.wait_for("OPTIONS")[0], "0")
         peers[0].send("SET_FAST", 1)
         self.assertEqual(peers[0].wait_for("EVENT"), ["ERROR", "FAST_MODE_REQUIRES_2_OR_3_PLAYERS"])
         peers[0].send("START")
@@ -325,6 +328,9 @@ class ServerIntegrationTests(unittest.TestCase):
         host = peers[0]
         app = App()
         self.addCleanup(app.destroy)
+        positions = patch.object(app, "_choose_position", return_value=0)
+        positions.start()
+        self.addCleanup(positions.stop)
         app.withdraw()
         app.host.set("127.0.0.1")
         app.port.set(port)
@@ -401,8 +407,7 @@ class ServerIntegrationTests(unittest.TestCase):
             if actor == app.player_id:
                 if state.phase == "KITTEN":
                     self.assertFalse(hasattr(app, "decline_button"))
-                    with patch.object(app, "_choose_position", return_value=0):
-                        app.resolve_button.invoke()
+                    app._open_auto_prompt()
                 else:
                     app.draw_button.invoke()
             elif state.phase == "KITTEN":
